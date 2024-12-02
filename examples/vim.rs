@@ -1113,7 +1113,7 @@ where
         // Check for new instructions from processing thread
         if let Some(new_song) = audio_song.swap(None, Ordering::AcqRel) {
             song = *new_song;
-            eprintln!("{:#?}", song.clone());
+            //eprintln!("{:#?}", song.clone());
 
             reset_adjust = DEFAULT_ADJUST;
             do_adjust(&song.prefix, &mut reset_adjust, &DEFAULT_ADJUST);
