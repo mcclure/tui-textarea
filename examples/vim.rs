@@ -124,7 +124,7 @@ struct VimAudioSeed {
 // a&b: One, then the other
 
 // TODOs/document: pv, dv; !
-// TODOs/consider: pr, dr; &&, &&&; !!, !; :;
+// TODOs/consider: pr, dr; &&, &&&; !!; #, ##; :;
 
 // In comments below: An //AT comment implies audio thread only, a //PT comment implies processing thread only
 // There are two forms of this AST, a "raw" form and a "clean" form, but they have the same type.
@@ -172,15 +172,49 @@ struct Song {
 fn parse_language(input:String) -> Result<Song, pom::Error> { // FIXME: &String?
     use pom::utf8::*;
 
+    // Whitespace types
+
+    const SPACES:&str = " \t\r\n";
+    const SPACES_HASH:&str = " \t\r\n#";
+    const INLINE_SPACES:&str = " \t";
+    const NEWLINE_SPACES:&str = "\r\n";
+
+    // TODO: Thread in multiline pervasively so we can have t ++ 3
     fn opt_space<'a>() -> Parser<'a, ()> {
-        one_of(" \t\r\n").repeat(0..).discard()
+        one_of(SPACES).repeat(0..).discard()
             .name("opt_space")
     }
 
-    fn space<'a>() -> Parser<'a, ()> {
-        one_of(" \t\r\n").repeat(1..).discard()
-            .name("space")
+    fn hash_word<'a>() -> Parser<'a, ()> {
+        sym('#').discard() * one_of(INLINE_SPACES).repeat(0..).discard()
+        * none_of(SPACES_HASH).repeat(1..).discard()
     }
+
+    fn hash_line<'a>() -> Parser<'a, ()> {
+        seq("##").discard() * none_of(NEWLINE_SPACES).repeat(0..).discard()
+    }
+
+    fn one_blank<'a>(multiline:bool) -> Parser<'a, ()> {
+        one_of(if multiline {SPACES} else {INLINE_SPACES}).discard() | hash_word() | hash_line()
+    }
+
+    fn inline_opt_blank<'a>() -> Parser<'a, ()> {
+        one_blank(false).repeat(0..).discard()
+    }
+
+    fn inline_blank<'a>() -> Parser<'a, ()> {
+        one_blank(false).repeat(1..).discard()
+    }
+
+    fn opt_blank<'a>() -> Parser<'a, ()> {
+        one_blank(true).repeat(0..).discard()
+    }
+
+    fn blank<'a>() -> Parser<'a, ()> {
+        one_blank(true).repeat(1..).discard()
+    }
+
+    // Primitive tokens
 
     fn positive<'a>() -> Parser<'a, i32> {
         let integer = (one_of("123456789").discard() * one_of("0123456789").discard().repeat(0..)).discard()
@@ -190,6 +224,8 @@ fn parse_language(input:String) -> Result<Song, pom::Error> { // FIXME: &String?
         integer.collect().convert(|x| x.parse::<i32>())
             .name("positive")
     }
+
+    // Compound tokens
 
     fn act<'a>(set:bool) -> Parser<'a, Act> {
         {
@@ -223,7 +259,7 @@ fn parse_language(input:String) -> Result<Song, pom::Error> { // FIXME: &String?
 
     fn note<'a>() -> Parser<'a, Note> { // TODO: Collapse Option<Vec<Adjust>> into Vec<Adjust> and use 0..?
         (
-            (adjust() - space()).repeat(0..) + note_pitch()
+            (adjust() - blank()).repeat(0..) + note_pitch()
         ).name("note")
     }
 
@@ -238,7 +274,7 @@ fn parse_language(input:String) -> Result<Song, pom::Error> { // FIXME: &String?
     fn node<'a>() -> Parser<'a, Node> {
         (
             (
-                note().map(Node::Play) + (opt_space() * sym('&') * opt_space() * note().map(Node::Play)).repeat(1..)
+                note().map(Node::Play) + (opt_blank() * sym('&') * opt_blank() * note().map(Node::Play)).repeat(1..)
             ).map(tuple_merge).map(Node::Fork)
             | note().map(Node::Play)
         ).name("node")
@@ -249,13 +285,20 @@ fn parse_language(input:String) -> Result<Song, pom::Error> { // FIXME: &String?
     // TODO: parser should produce a song
     let parser =
         (
-            opt_space() * sym('!') * opt_space() *
-            (adjust() + (one_of(" \t") * adjust()).repeat(0..)).map(tuple_merge)
-            - sym('\n')
+            opt_space() * sym('!') * (
+                (
+                    inline_opt_blank() *
+                    (adjust() + (inline_blank() * adjust()).repeat(0..)).map(tuple_merge)
+                )
+                | inline_opt_blank().map(|_|vec![])
+            ) - sym('\n')
         ).repeat(0..).map(|v|v.into_iter().flatten().collect()) +
         (
-            opt_space() *
-            (node() + (space() * node()).repeat(0..)).map(tuple_merge) - opt_space() - end()
+            (
+                opt_blank() *
+                (node() + (blank() * node()).repeat(0..)).map(tuple_merge) - opt_blank() - end()
+            )
+            | opt_blank().map(|_|vec![]) // Empty file is valid
         )
     ;
     parser.map(|(prefix, score)|Song {prefix, score}).parse_str(&input)
@@ -1362,7 +1405,7 @@ async fn main() -> io::Result<()> {
                                     let all = textarea.lines().join("\n");
                                     let song = if all.len() > 0 {parse_language(all)}
                                         else { Ok(Default::default()) }; // Empty string is valid
-                                    //eprintln!("D: {:?}", song.clone());
+                                    //eprintln!("D: {:?}", song.clone()); // Before processing
                                     match song {
                                         Ok(song) => {
                                             // I *think* I don't need SeqCst because only one thread writes?
