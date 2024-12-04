@@ -340,14 +340,14 @@ enum CommandLineSetType {
     Question
 }
 
-enum CommandLineFileType {
+enum CommandLineFileOp {
     Read(bool), // Force?
     Write
 }
 
 // TODO: reset, reset!, set for tones, play
 enum CommandLine {
-    File(CommandLineFileType, String), // write?, name
+    File(CommandLineFileOp, bool, String), // write?, "in-buffer"?, name
     Wqae(bool, bool, CommandLineTotality, bool), // Write, Quit, All/Buffer, Exclamation
     Help(String),
     Set(String, CommandLineSetType), // What you set, what you set it to // TODO: Local?
@@ -359,6 +359,10 @@ enum CommandLine {
 // TODO: ignore surrounding whitespace
 fn parse_command_line(input:String) -> Result<CommandLine, pom::Error> { // FIXME: &String?
     use pom::utf8::*;
+
+    fn opt_space<'a>() -> Parser<'a, ()> {
+        one_of(" \t").repeat(0..).discard()
+    }
 
     fn space<'a>() -> Parser<'a, ()> {
         one_of(" \t").repeat(1..).discard()
@@ -384,11 +388,15 @@ fn parse_command_line(input:String) -> Result<CommandLine, pom::Error> { // FIXM
         ).map(|(((a,b),c),d)| CommandLine::Wqae(a,b,c,d));
 
     let parser = (
-          (sym('w').discard() | seq("write").discard())
-            * space() * unspace().collect().map(|x| CommandLine::File(CommandLineFileType::Write, x.to_string()))
+          ((sym('w').discard() | seq("write").discard())
+            * (sym('v').discard() | seq("visual").discard()).opt()
+            + space() * unspace().collect()).map(|(visual, x)| CommandLine::File(CommandLineFileOp::Write, visual.is_some(), x.to_string()))
 
         | ((sym('e').discard() | seq("edit").discard()) * sym('!').discard().opt().map(|x|x.is_some())
-            + space() * unspace().collect()).map(|(force, x)| CommandLine::File(CommandLineFileType::Read(force), x.to_string()))
+            + space() * unspace().collect()).map(|(force, x)| CommandLine::File(CommandLineFileOp::Read(force), false, x.to_string()))
+
+        | ((sym('!').discard() * opt_space()).opt() * (seq("cat"))
+            * space() * unspace().collect()).map(|x| CommandLine::File(CommandLineFileOp::Read(false), true, x.to_string()))
 
         | wqae
 
@@ -426,6 +434,15 @@ impl Vim {
             dirty,
             audio
         }
+    }
+
+    // Dump the contents of a file to a vector.
+    // TODO merge with load<>?
+    fn load_raw<'a>(&self, file: &PathBuf) -> io::Result<Vec<String>> {
+        let file = fs::File::open(file)?;
+        io::BufReader::new(file)
+            .lines()
+            .collect::<io::Result<_>>()
     }
 
     // Create a textarea containing the contents of a file.
@@ -1030,24 +1047,103 @@ impl Vim {
                                 return (Transition::Quit, false, None); // Short circuit
                             }
                         },
-                        Ok(CommandLine::File(CommandLineFileType::Read(force), path)) => {
+                        Ok(CommandLine::File(op, inline, path)) => {
                             let path = Path::new(&path).to_path_buf();
-                            if let Ok(new_textarea) = self.load(Some(&path)) {
-                                *textarea = new_textarea;
-                                return (Transition::Mode(Mode::Normal), true, Some(path))
-                            } else {
-                                self.beep();
+                            match (op, inline) {
+                                // Simple file operations
+                                (CommandLineFileOp::Read(force), false) =>
+                                    if let Ok(new_textarea) = self.load(Some(&path)) {
+                                        *textarea = new_textarea;
+                                        return (Transition::Mode(Mode::Normal), true, Some(path))
+                                    } else {
+                                        self.beep();
+                                    },
+                                (CommandLineFileOp::Write, false) =>
+                                    if self.save(Some(&path), textarea.lines()).is_ok() {
+                                        return (Transition::Mode(Mode::Normal), false, Some(path))
+                                    } else {
+                                        self.beep();
+                                    },
+
+                                // Special "in-buffer" file operations--
+                                // activated with :cat and :wv these paste a file *into* a buffer,
+                                // or read selected text out of a buffer, rather than whole files.
+                                (CommandLineFileOp::Read(_), true) => {
+                                    if let Ok(file_lines) = self.load_raw(&path) {
+                                        if let Some(((from_line, from_idx), (to_line, to_idx))) = textarea.selection_range() {
+                                            textarea.cut();
+                                        }
+                                        let (cursor_line, cursor_char) = textarea.cursor();
+
+                                        let in_lines = textarea.lines();
+                                        let mut out_lines: Vec<String> = Default::default();
+
+                                        // Manual surgery to insert file_lines into the middle of in_lines
+                                        for line_idx in 0..cursor_line {
+                                            out_lines.push(in_lines[line_idx].clone()) // Clone can TECHNICALLY be avoided but it would be so ugly.
+                                        }
+                                        {
+                                            let mut s:String = Default::default();
+                                            s += &in_lines[cursor_line][0..cursor_char];
+                                            if file_lines.len() > 0 {
+                                                s += &file_lines[0];
+                                                for file_line_idx in 1..file_lines.len() {
+                                                    out_lines.push(s);
+                                                    s = Default::default();
+                                                    s += &file_lines[file_line_idx];
+                                                }
+                                            }
+                                            s += &in_lines[cursor_line][cursor_char..];
+                                            out_lines.push(s);
+                                        }
+                                        for line_idx in (cursor_line+1)..in_lines.len() {
+                                            out_lines.push(in_lines[line_idx].clone()) // See note above
+                                        }
+
+                                        let mut new_textarea = TextArea::new(out_lines);
+                                        *textarea = new_textarea;
+                                        textarea.move_cursor(CursorMove::Jump(cursor_line as u16, cursor_char as u16));
+                                        return (Transition::Mode(Mode::Normal), true, Some(path))
+                                    } else {
+                                        self.beep();
+                                    }
+                                },
+                                (CommandLineFileOp::Write, true) => {
+                                    if let Some(((from_line, from_idx), (to_line, to_idx))) = textarea.selection_range() {
+                                        // ????
+//                                        textarea.move_cursor(CursorMove::Forward); // Vim's text selection is inclusive
+
+                                        let in_lines = textarea.lines();
+                                        let mut out_lines: Vec<String> = Default::default();
+                                        // FIXME: Do we have "extract text" elsewhere?
+                                        if from_line == to_line {
+                                            out_lines.push(in_lines[from_line][from_idx..=to_idx].to_string())
+                                        } else {
+                                            for line_idx in from_line..=to_line {
+                                                let in_line = in_lines[line_idx].clone();
+                                                if line_idx == from_line {
+                                                    out_lines.push(in_line[from_idx..].to_string());
+                                                } else if line_idx == to_line {
+                                                    out_lines.push(in_line[..=to_idx].to_string());
+                                                } else {
+                                                    out_lines.push(in_line);
+                                                }
+                                            }
+                                        }
+                                        if self.save(Some(&path), &out_lines).is_ok() {
+                                            // Not sure I like this behavior, but it's what vi does? --mcc
+                                            textarea.cancel_selection();
+                                            textarea.move_cursor(CursorMove::Jump(from_line as u16, from_idx as u16));
+                                            return (Transition::Mode(Mode::Normal), false, None)
+                                        } else {
+                                            self.beep();
+                                        }
+                                    } else {
+                                        self.beep();
+                                    }
+                                },
                             }
                         },
-                        Ok(CommandLine::File(CommandLineFileType::Write, path)) => {
-                            let path = Path::new(&path).to_path_buf();
-
-                            if self.save(Some(&path), textarea.lines()).is_ok() {
-                                return (Transition::Mode(Mode::Normal), false, Some(path))
-                            } else {
-                                self.beep();
-                            }
-                        }
                         _ => {
                             self.beep(); // TODO print useful message
                         }
