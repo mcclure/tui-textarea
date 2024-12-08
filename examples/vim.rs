@@ -296,10 +296,11 @@ fn parse_language(input:String) -> Result<Song, pom::Error> { // FIXME: &String?
         (
             (
                 opt_blank() *
-                (node() + (blank() * node()).repeat(0..)).map(tuple_merge) - opt_blank() - end()
+                (node() + (blank() * node()).repeat(0..)).map(tuple_merge) - opt_blank()
             )
             | opt_blank().map(|_|vec![]) // Empty file is valid
         )
+        - end()
     ;
     parser.map(|(prefix, score)|Song {prefix, score}).parse_str(&input)
 }
