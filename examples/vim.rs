@@ -1474,8 +1474,8 @@ async fn main() -> io::Result<()> {
                                     for line in textarea.lines() {
                                         line_starts.push(all.len());
                                         all = all + line;
+                                        all = all + "\n";
                                     }
-                                    let all = textarea.lines().join("\n");
                                     let all_len = all.len();
                                     let song = if all_len > 0 {parse_language(all)}
                                         else { Ok(Default::default()) }; // Empty string is valid
