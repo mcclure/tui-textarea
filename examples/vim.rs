@@ -1465,7 +1465,7 @@ async fn main() -> io::Result<()> {
                         match (transition.clone(), vim.mode) {
                             (Transition::Nop, Mode::Normal) |
                             (Transition::Mode(Mode::Normal), _) => {
-                                if dirty {
+                                if vim.dirty {
                                     // Completely parse buffer
                                     // TODO: Factor elsewhere
                                     let mut line_starts:Vec<usize> = Default::default();
