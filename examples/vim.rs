@@ -1468,7 +1468,7 @@ async fn main() -> io::Result<()> {
                                 if vim.dirty {
                                     // Completely parse buffer
                                     // TODO: Factor elsewhere
-                                    let mut line_starts:Vec<usize> = Default::default();
+                                    let mut line_starts:Vec<usize> = Default::default(); // notice, in BYTES
                                     let mut all:String = Default::default();
                                     // FIXME: Since I'm scanning twice, why not allocate an early buffer
                                     for line in textarea.lines() {
@@ -1476,9 +1476,11 @@ async fn main() -> io::Result<()> {
                                         all = all + line;
                                     }
                                     let all = textarea.lines().join("\n");
-                                    let song = if all.len() > 0 {parse_language(all)}
+                                    let all_len = all.len();
+                                    let song = if all_len > 0 {parse_language(all)}
                                         else { Ok(Default::default()) }; // Empty string is valid
                                     //eprintln!("D: {:?}", song.clone()); // Before processing
+                                    textarea.clear_custom_highlight();
                                     match song {
                                         Ok(song) => {
                                             // I *think* I don't need SeqCst because only one thread writes?
@@ -1487,7 +1489,35 @@ async fn main() -> io::Result<()> {
                                         },
                                         Err(error) => {
                                             // TODO: Reverse Bad position
-                                            eprintln!("{}", error);
+                                            eprintln!("{}", error.clone());
+
+                                            let position = match error {
+                                                pom::Error::Incomplete => all_len,
+                                                pom::Error::Mismatch { position, .. } |
+                                                pom::Error::Conversion { position, .. } |
+                                                pom::Error::Expect { position, .. } |
+                                                pom::Error::Custom { position, .. } => position
+                                            };
+                                            let (line_idx, line_char) = match line_starts.binary_search(&position) {
+                                                Ok(line_idx) => (line_idx, 0 as usize),
+                                                Err(line_idx_plus) => {
+                                                    let line_idx = line_idx_plus-1; // It always gives the index after, and line_starts[0] is always 0
+                                                    let line_base = line_starts[line_idx];
+                                                    let line_byte = position - line_base;
+                                                    let line_char = {
+                                                        let mut result = 0;
+                                                        for (idx, _) in textarea.lines()[line_idx].char_indices() {
+                                                            if idx >= line_byte { // Can only be > if something went real wrong with utf-8
+                                                                break;
+                                                            }
+                                                            result += 1;
+                                                        }
+                                                        result
+                                                    };
+                                                    (line_idx, line_char) // WRONG FOR UTF-8 FIXME // ALSO: CURSED RETURN
+                                                }
+                                            };
+                                            textarea.custom_highlight(((line_idx, line_char), (line_idx, line_char+1)), Style::default().fg(Color::Red).add_modifier(Modifier::REVERSED), 35); // TODO if possible blink 25/35
                                         }
                                     }
 
