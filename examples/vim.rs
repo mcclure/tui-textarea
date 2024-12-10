@@ -109,6 +109,29 @@ struct VimAudioSeed {
     play: std::sync::Arc<AtomicBool>,
 }
 
+// Code by NicEastVillage on Github https://github.com/J-F-Liu/pom/issues/43#issuecomment-723645227
+// Adjusted for utf8
+// No known license, but code appears intended to be used and is fairly minimal
+
+#[derive(Debug, Clone)]
+struct Span {
+    begin: usize,
+    end: usize,
+}
+
+trait WithSpan<'a, O: 'a> {
+    fn with_span(self) -> pom::utf8::Parser<'a, (Span, O)>;
+}
+
+impl<'a, O: 'a> WithSpan<'a, O> for pom::utf8::Parser<'a, O> {
+    fn with_span(self) -> pom::utf8::Parser<'a, (Span, O)> {
+        (pom::utf8::empty().pos() + self + pom::utf8::empty().pos())
+            .map(|((begin, item), end)| (Span { begin, end }, item))
+    }
+}
+
+// End NicEastvillage code
+
 // Language
 
 // Number: Play this note
@@ -155,7 +178,12 @@ enum Pitch {
     Rest      // PT
 }
 
-type Note = (Vec<Adjust>, Pitch); // No adjustments -> vec len 0
+#[derive(Debug, Clone)]
+struct Note {
+    span: Span,
+    adjust: Vec<Adjust>, // No adjustments -> vec len 0
+    pitch: Pitch,        // "Note value", may not correpsond to pitch per se
+}
 
 #[derive(Debug, Clone)]
 enum Node {
@@ -262,7 +290,7 @@ fn parse_language(input:String) -> Result<Song, pom::Error> { // FIXME: &String?
     fn note<'a>() -> Parser<'a, Note> { // TODO: Collapse Option<Vec<Adjust>> into Vec<Adjust> and use 0..?
         (
             (adjust() - blank()).repeat(0..) + note_pitch()
-        ).name("note")
+        ).name("note").with_span().map(|(span, (adjust, pitch))| Note {span, adjust, pitch})
     }
 
     // Utility
@@ -1126,7 +1154,7 @@ where
     // Constants for audio engine
     const BPM:i32 = 110;
     const SQUARE_RADIX:i32 = 32; // "Subsample" fixed point for better pitch accuracy
-    const REST_NODE:Node = Node::Play((vec![], Pitch::Abs(0)));
+    const REST_NODE:Node = Node::Play(Note { span: Span { begin:0, end:0 }, adjust: vec![], pitch: Pitch::Abs(0) });
     const DEFAULT_RATE:i32 = (60.0*48000.0/(BPM as f64)/4.0) as i32;
     const DEFAULT_ADJUST:AdjustState = AdjustState {
         root:69-12, pitch:0, rate:DEFAULT_RATE, duty:8, duty_vs:8, duty_as_sample_cache:DEFAULT_RATE
@@ -1166,9 +1194,9 @@ where
                         Act::Set(x) => state.duty = *x,
                         Act::Increment(x) => state.duty += *x,
                         Act::Double(x) => if *x > 0 {
-                            state.rate *= *x;
+                            state.duty *= *x;
                         } else {
-                            state.rate /= -*x;
+                            state.duty /= -*x;
                         },
                         Act::Versus(x) => {
                             // Kludge?: Rescale duty to duty_vs
@@ -1274,16 +1302,16 @@ where
         let note = &song.score[state.play.beat_at];
         if need_adjustment {
             match &song.score[state.play.beat_at] {
-                Node::Play((v, _)) => {
+                Node::Play(Note {adjust:v, ..}) => {
                     do_adjust(v, &mut state.adjust, &reset_adjust);
                 },
                 _ => unreachable!()
             }
         }
         let pitch_index = match &song.score[state.play.beat_at] {
-            Node::Play((_, Pitch::Abs(x))) => fit_range(*x), // Never generated?
-            Node::Play((_, Pitch::Rel(x))) => fit_range(*x + state.adjust.root),
-            Node::Play((_, Pitch::Rest)) => 0,
+            Node::Play(Note { pitch:Pitch::Abs(x), ..}) => fit_range(*x), // Never generated?
+            Node::Play(Note { pitch:Pitch::Rel(x), ..}) => fit_range(*x + state.adjust.root),
+            Node::Play(Note { pitch:Pitch::Rest, ..}) => 0,
             _ => unreachable!()
         };
         // Map note->synth zero crossing peroid
