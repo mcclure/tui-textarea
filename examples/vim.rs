@@ -109,24 +109,28 @@ struct VimAudioSeed {
     play: std::sync::Arc<AtomicBool>,
 }
 
+// Ranges the way TextArea thinks about them
+type TextRange = ((usize, usize), (usize, usize));
+
+// Ranges the way pom thinks about them
 // Code by NicEastVillage on Github https://github.com/J-F-Liu/pom/issues/43#issuecomment-723645227
 // Adjusted for utf8
 // No known license, but code appears intended to be used and is fairly minimal
 
 #[derive(Debug, Clone)]
-struct Span {
+struct ByteSpan {
     begin: usize,
     end: usize,
 }
 
 trait WithSpan<'a, O: 'a> {
-    fn with_span(self) -> pom::utf8::Parser<'a, (Span, O)>;
+    fn with_span(self) -> pom::utf8::Parser<'a, (ByteSpan, O)>;
 }
 
 impl<'a, O: 'a> WithSpan<'a, O> for pom::utf8::Parser<'a, O> {
-    fn with_span(self) -> pom::utf8::Parser<'a, (Span, O)> {
+    fn with_span(self) -> pom::utf8::Parser<'a, (ByteSpan, O)> {
         (pom::utf8::empty().pos() + self + pom::utf8::empty().pos())
-            .map(|((begin, item), end)| (Span { begin, end }, item))
+            .map(|((begin, item), end)| (ByteSpan { begin, end }, item))
     }
 }
 
@@ -180,7 +184,7 @@ enum Pitch {
 
 #[derive(Debug, Clone)]
 struct Note {
-    span: Span,
+    span: ByteSpan,
     adjust: Vec<Adjust>, // No adjustments -> vec len 0
     pitch: Pitch,        // "Note value", may not correpsond to pitch per se
 }
@@ -1154,7 +1158,7 @@ where
     // Constants for audio engine
     const BPM:i32 = 110;
     const SQUARE_RADIX:i32 = 32; // "Subsample" fixed point for better pitch accuracy
-    const REST_NODE:Node = Node::Play(Note { span: Span { begin:0, end:0 }, adjust: vec![], pitch: Pitch::Abs(0) });
+    const REST_NODE:Node = Node::Play(Note { span: ByteSpan { begin:0, end:0 }, adjust: vec![], pitch: Pitch::Abs(0) });
     const DEFAULT_RATE:i32 = (60.0*48000.0/(BPM as f64)/4.0) as i32;
     const DEFAULT_ADJUST:AdjustState = AdjustState {
         root:69-12, pitch:0, rate:DEFAULT_RATE, duty:8, duty_vs:8, duty_as_sample_cache:DEFAULT_RATE
@@ -1435,6 +1439,7 @@ async fn main() -> io::Result<()> {
 
     textarea.set_block(Mode::Normal.block());
     textarea.set_cursor_style(Mode::Normal.cursor_style());
+    textarea.set_cursor_line_style(Style::default().bg(/*Color::DarkGray*/Color::Indexed(232) /*236 better on pure black bg*/));
 
     // This is the command-line-mode :entry box, which is only sometimes visible.
     let mut command = TextArea::default();
@@ -1447,13 +1452,28 @@ async fn main() -> io::Result<()> {
     let mut events = crossterm::event::EventStream::new();
     let mut should_quit = false;
 
-    let mut song_highlights: Vec<((usize, usize), (usize, usize))> = Default::default();
+    // Highlight memory
+    let mut error_highlight: Option<TextRange> = None;
+    let mut song_highlights: Vec<TextRange> = Default::default();
 
     while !should_quit {
         tokio::select! {
             // FIXME: rather than this wait on mspc messages or something
             // Used to this happened every loop
-            _ = interval.tick() => { term.draw(|f| {
+            _ = interval.tick() => {
+                let play = (*vim.audio.play).load(Ordering::Relaxed);
+                let time = (*vim.audio.time).load(Ordering::Relaxed);
+
+                // TODO: This is work! Don't do it every time
+                textarea.clear_custom_highlight();
+                if let Some(highlight) = error_highlight {
+                    textarea.custom_highlight(highlight, Style::default().fg(Color::Red).add_modifier(Modifier::REVERSED), 35); // TODO if possible blink 25/35
+                }
+                if (play || time > 0) && (time as usize) < song_highlights.len() {
+                    textarea.custom_highlight(song_highlights[time as usize], Style::default().fg(/*Color::LightCyan*/Color::Indexed(51)).add_modifier(Modifier::UNDERLINED), 35); // TODO if possible blink 25/35
+                }
+
+                term.draw(|f| {
                     f.render_widget(&textarea, f.area());
                     let mut bottom_line_area = f.area();
                     bottom_line_area.y = bottom_line_area.height-1;
@@ -1467,7 +1487,7 @@ async fn main() -> io::Result<()> {
                         bottom_line_area.width -= 1;
                         f.render_widget(&command, bottom_line_area);
                     } else {
-                        let bar = ratatui::widgets::Paragraph::new(format!("{} {}", if (*vim.audio.play).load(Ordering::Relaxed) { "PLAYING" } else {"Paused "}, (*vim.audio.time).load(Ordering::Relaxed)));
+                        let bar = ratatui::widgets::Paragraph::new(format!("{} {}", if play { "PLAYING" } else {"Paused "}, time));
                         f.render_widget(bar, bottom_line_area);
                     }
                 })?;
@@ -1510,7 +1530,9 @@ async fn main() -> io::Result<()> {
                                     let song = if all_len > 0 {parse_language(all)}
                                         else { Ok(Default::default()) }; // Empty string is valid
                                     //eprintln!("D: {:?}", song.clone()); // Before processing
-                                    textarea.clear_custom_highlight();
+
+                                    error_highlight = None;
+
                                     match song {
                                         Ok(song) => {
                                             // I *think* I don't need SeqCst because only one thread writes?
@@ -1525,7 +1547,7 @@ async fn main() -> io::Result<()> {
                                                 song_highlights.clear();
                                                 for node in &song.score {
                                                     match node {
-                                                        Node::Play(Note { span:Span { begin, end }, ..}) => {
+                                                        Node::Play(Note { span:ByteSpan { begin, end }, ..}) => {
                                                             use tuple_map::*;
                                                             song_highlights.push((begin,end).map(|idx| {
                                                                 let idx = *idx;
@@ -1553,7 +1575,7 @@ async fn main() -> io::Result<()> {
                                                         _ => (),
                                                     }
                                                 }
-                                                // FIXME: -1 on highlight end
+                                                // Note: All ranges are incidentally +1, but that's the way TextArea wants it
                                             }
 
                                             audio_song.store(Some(Box::new(song)), Ordering::AcqRel)
@@ -1588,7 +1610,7 @@ async fn main() -> io::Result<()> {
                                                     (line_idx, line_char) // WRONG FOR UTF-8 FIXME // ALSO: CURSED RETURN
                                                 }
                                             };
-                                            textarea.custom_highlight(((line_idx, line_char), (line_idx, line_char+1)), Style::default().fg(Color::Red).add_modifier(Modifier::REVERSED), 35); // TODO if possible blink 25/35
+                                            error_highlight = Some(((line_idx, line_char), (line_idx, line_char+1)));
                                         }
                                     }
 
