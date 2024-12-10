@@ -2129,6 +2129,7 @@ dependencies = [
  "termwiz",
  "tokio",
  "tui",
+ "tuple-map",
  "unicode-width 0.2.0",
 ]
 
@@ -2141,6 +2142,12 @@ dependencies = [
  "ratatui",
  "tui-textarea",
 ]
+
+[[package]]
+name = "tuple-map"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23d5919d7121237af683b7fa982450597b1eaa2643e597aec3b519e4e5ab3d62"
 
 [[package]]
 name = "typenum"

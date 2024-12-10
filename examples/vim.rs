@@ -1447,6 +1447,8 @@ async fn main() -> io::Result<()> {
     let mut events = crossterm::event::EventStream::new();
     let mut should_quit = false;
 
+    let mut song_highlights: Vec<((usize, usize), (usize, usize))> = Default::default();
+
     while !should_quit {
         tokio::select! {
             // FIXME: rather than this wait on mspc messages or something
@@ -1513,6 +1515,47 @@ async fn main() -> io::Result<()> {
                                         Ok(song) => {
                                             // I *think* I don't need SeqCst because only one thread writes?
                                             let song = absolute_language(song);
+
+                                            // Calculate highlights map
+                                            {
+                                                let mut line_at = 0;
+                                                let mut char_at = 0;
+                                                let mut chars:Option<std::str::Chars> = None;
+                                                let lines = &textarea.lines();
+                                                song_highlights.clear();
+                                                for node in &song.score {
+                                                    match node {
+                                                        Node::Play(Note { span:Span { begin, end }, ..}) => {
+                                                            use tuple_map::*;
+                                                            song_highlights.push((begin,end).map(|idx| {
+                                                                let idx = *idx;
+                                                                let line_at_was = line_at;
+                                                                // Step forward lines until line_starts is *just about* to pass our index.
+                                                                while line_at + 1 < line_starts.len() && line_starts[line_at+1] <= idx {
+                                                                    line_at+=1;
+                                                                }
+                                                                // We moved forward a line (or started)
+                                                                if chars.is_none() || line_at > line_at_was {
+                                                                    char_at = 0;
+                                                                    chars = Some(lines[line_at].chars()); // FIXME: fuse()?
+                                                                }
+                                                                let within_idx = idx - line_starts[line_at];
+                                                                let chars = chars.as_mut().unwrap();
+                                                                loop {
+                                                                    let position = lines[line_at].len() - chars.as_str().len(); // Freakish but works
+                                                                    if position >= within_idx { break }; // Implicitly assumes all notes length 1 or greater
+                                                                    if chars.next().is_none() { break }
+                                                                    char_at += 1;
+                                                                }
+                                                                (line_at, char_at)
+                                                            }));
+                                                        },
+                                                        _ => (),
+                                                    }
+                                                }
+                                                // FIXME: -1 on highlight end
+                                            }
+
                                             audio_song.store(Some(Box::new(song)), Ordering::AcqRel)
                                         },
                                         Err(error) => {
