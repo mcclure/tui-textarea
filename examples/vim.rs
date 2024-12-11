@@ -422,12 +422,13 @@ fn parse_command_line(input:String) -> Result<CommandLine, pom::Error> { // FIXM
         ).map(|(((a,b),c),d)| CommandLine::Wqae(a,b,c,d));
 
     let parser = (
-          ((sym('w').discard() | seq("write").discard())
+          ((seq("write").discard() | sym('w').discard())
             * (sym('v').discard() | seq("visual").discard()).opt()
             + space() * unspace().collect()).map(|(visual, x)| CommandLine::File(CommandLineFileOp::Write, visual.is_some(), x.to_string()))
 
-        | ((sym('e').discard() | seq("edit").discard()) * sym('!').discard().opt().map(|x|x.is_some())
-            + space() * unspace().collect()).map(|(force, x)| CommandLine::File(CommandLineFileOp::Read(force), false, x.to_string()))
+        | ((seq("edit").discard() | sym('e').discard())
+            * sym('!').discard().opt()
+            + space() * unspace().collect()).map(|(force, x)| CommandLine::File(CommandLineFileOp::Read(force.is_some()), false, x.to_string()))
 
         | ((sym('!').discard() * opt_space()).opt() * (seq("cat"))
             * space() * unspace().collect()).map(|x| CommandLine::File(CommandLineFileOp::Read(false), true, x.to_string()))
@@ -1205,6 +1206,7 @@ impl Vim {
                         Ok(CommandLine::Beep) => {
                             self.beep();
                         },
+                        //Err(e) => { eprintln!("ERR {}", e); },
                         _ => { // : syntax error // TODO: print error if any?
                             error = Some(format!("Not a command: {}", command.lines()[0].clone()));
                             self.beep(); // TODO print useful message
