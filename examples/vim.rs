@@ -1071,38 +1071,18 @@ impl Vim {
                                 // or read selected text out of a buffer, rather than whole files.
                                 (CommandLineFileOp::Read(_), true) => {
                                     if let Ok(file_lines) = self.load_raw(&path) {
-                                        if let Some(((from_line, from_idx), (to_line, to_idx))) = textarea.selection_range() {
+                                        let old_yank = textarea.yank_text();
+
+                                        if textarea.selection_range().is_some() {
+                                            textarea.move_cursor(CursorMove::Forward); // Vim's text selection is inclusive
                                             textarea.cut();
                                         }
                                         let (cursor_line, cursor_char) = textarea.cursor();
 
-                                        let in_lines = textarea.lines();
-                                        let mut out_lines: Vec<String> = Default::default();
+                                        textarea.set_yank_text(file_lines.join("\n"));
+                                        textarea.paste();
+                                        textarea.set_yank_text(old_yank);
 
-                                        // Manual surgery to insert file_lines into the middle of in_lines
-                                        for line_idx in 0..cursor_line {
-                                            out_lines.push(in_lines[line_idx].clone()) // Clone can TECHNICALLY be avoided but it would be so ugly.
-                                        }
-                                        {
-                                            let mut s:String = Default::default();
-                                            s += &in_lines[cursor_line][0..cursor_char];
-                                            if file_lines.len() > 0 {
-                                                s += &file_lines[0];
-                                                for file_line_idx in 1..file_lines.len() {
-                                                    out_lines.push(s);
-                                                    s = Default::default();
-                                                    s += &file_lines[file_line_idx];
-                                                }
-                                            }
-                                            s += &in_lines[cursor_line][cursor_char..];
-                                            out_lines.push(s);
-                                        }
-                                        for line_idx in (cursor_line+1)..in_lines.len() {
-                                            out_lines.push(in_lines[line_idx].clone()) // See note above
-                                        }
-
-                                        let mut new_textarea = TextArea::new(out_lines);
-                                        *textarea = new_textarea;
                                         textarea.move_cursor(CursorMove::Jump(cursor_line as u16, cursor_char as u16));
                                         return (Transition::Mode(Mode::Normal), true, Some(path))
                                     } else {
