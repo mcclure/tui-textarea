@@ -1062,14 +1062,19 @@ impl Vim {
                     // Process line… this is heaviweight and maybe should be its own Thing
                     let line0 = command.lines()[0].clone();
                     let entry = parse_command_line(line0);
+                    let mut error:Option<String> = None;
 
-                    match entry { // Notice: Currently w not supported
+                    match entry { // Notice: Currently ! not supported
                         Ok(CommandLine::Wqae(w, q, _totality, _exclamation)) => {
                             if w {
-                                if self.save(None, textarea.lines()).is_ok() {
-                                    return VimChanges { transition: if q {Transition::Quit} else {Transition::Mode(Mode::Normal)}, ..NOP }
-                                } else {
-                                    self.beep();
+                                match self.save(None, textarea.lines()) {
+                                    Ok(()) => {
+                                        return VimChanges { transition: if q {Transition::Quit} else {Transition::Mode(Mode::Normal)}, ..NOP }
+                                    }
+                                    Err(e) => {
+                                        error = Some(format!("Error: Cannot w+q: {e}"));
+                                        self.beep();
+                                    }
                                 }
                             } else if q {
                                 return VimChanges { transition:Transition::Quit, ..NOP }; // Short circuit
@@ -1077,20 +1082,28 @@ impl Vim {
                         },
                         Ok(CommandLine::File(CommandLineFileType::Read(force), path)) => {
                             let path = Path::new(&path).to_path_buf();
-                            if let Ok(new_textarea) = self.load(Some(&path)) {
-                                *textarea = new_textarea;
-                                return VimChanges { transition:Transition::Mode(Mode::Normal), dirty:true, current_file:Some(path), ..NOP }
-                            } else {
-                                self.beep();
+                            match self.load(Some(&path)) {
+                                Ok(new_textarea) => {
+                                    *textarea = new_textarea;
+                                    return VimChanges { transition:Transition::Mode(Mode::Normal), dirty:true, current_file:Some(path), ..NOP }
+                                },
+                                Err(e) => {
+                                    error = Some(format!("Error: Cannot write: {e}"));
+                                    self.beep();
+                                }
                             }
                         },
                         Ok(CommandLine::File(CommandLineFileType::Write, path)) => {
                             let path = Path::new(&path).to_path_buf();
 
-                            if self.save(Some(&path), textarea.lines()).is_ok() {
-                                return VimChanges { transition:Transition::Mode(Mode::Normal), current_file:Some(path), ..NOP }
-                            } else {
-                                self.beep();
+                            match self.save(None, textarea.lines()) {
+                                Ok(()) => {
+                                    return VimChanges { transition:Transition::Mode(Mode::Normal), current_file:Some(path), ..NOP }
+                                },
+                                Err(e) => {
+                                    error = Some(format!("Error: Cannot read: {e}"));
+                                    self.beep();
+                                }
                             }
                         }
                         _ => {
@@ -1098,7 +1111,7 @@ impl Vim {
                         }
                     }
 
-                    VimChanges { transition:Transition::Mode(Mode::Normal), ..NOP }
+                    VimChanges { transition:Transition::Mode(Mode::Normal), status_message:error, ..NOP }
                 },
                 // Type into command buffer
                 _ => {
@@ -1426,6 +1439,8 @@ async fn main() -> io::Result<()> {
     struct Cli {
         #[arg(long = "play")]
         play: bool,
+        #[arg(long = "loud-error", short='e')]
+        loud_error:bool,
         filename: Option<PathBuf>
     }
     let cli = Cli::parse();
@@ -1463,9 +1478,10 @@ async fn main() -> io::Result<()> {
     let mut events = crossterm::event::EventStream::new();
     let mut should_quit = false;
 
-    // Highlight memory
+    // Extra GUI state
     let mut error_highlight: Option<TextRange> = None;
     let mut song_highlights: Vec<TextRange> = Default::default();
+    let mut current_status_message: Option<String> = None;
 
     while !should_quit {
         tokio::select! {
@@ -1478,7 +1494,7 @@ async fn main() -> io::Result<()> {
                 // TODO: This is work! Don't do it every time
                 textarea.clear_custom_highlight();
                 if let Some(highlight) = error_highlight {
-                    textarea.custom_highlight(highlight, Style::default().fg(Color::Red).add_modifier(Modifier::REVERSED), 35); // TODO if possible blink 25/35
+                    textarea.custom_highlight(highlight, Style::default().fg(Color::LightRed).add_modifier(Modifier::REVERSED), 35); // TODO if possible blink 25/35
                 }
                 if (play || time > 0) && (time as usize) < song_highlights.len() {
                     textarea.custom_highlight(song_highlights[time as usize], Style::default().fg(/*Color::LightCyan*/Color::Indexed(51)).add_modifier(Modifier::UNDERLINED), 35); // TODO if possible blink 25/35
@@ -1491,12 +1507,18 @@ async fn main() -> io::Result<()> {
                     bottom_line_area.height=1;
 
                     if vim.mode.clone() == Mode::Command {
+                        current_status_message = None;
+
                         let bar = ratatui::widgets::Paragraph::new(":");
                         f.render_widget(bar, bottom_line_area);
 
                         bottom_line_area.x += 1;
                         bottom_line_area.width -= 1;
                         f.render_widget(&command, bottom_line_area);
+                    } else if let Some(status) = &current_status_message {
+                        let bar = ratatui::widgets::Paragraph::new(status.clone());
+                        let bar = bar.style(Style::default().fg(Color::LightRed).add_modifier(Modifier::REVERSED));
+                        f.render_widget(bar, bottom_line_area);
                     } else {
                         let bar = ratatui::widgets::Paragraph::new(format!("{} {}", if play { "PLAYING" } else {"Paused "}, time));
                         f.render_widget(bar, bottom_line_area);
@@ -1516,6 +1538,14 @@ async fn main() -> io::Result<()> {
                     },
                     _ => { // Mode match
                         let VimChanges { transition, dirty, current_file, status_message } = vim.transition(event.into(), &mut textarea, &mut command);
+
+                        if status_message.is_some() {
+                            if cli.loud_error { eprintln!("{}", status_message.clone().unwrap()); }
+
+                            current_status_message = status_message;
+                        } else if dirty {
+                            current_status_message = None;
+                        }
 
                         // Ugly: This code is written in a super functional style and between here and the vim = my added code just treats it as mutable
 
@@ -1593,7 +1623,9 @@ async fn main() -> io::Result<()> {
                                         },
                                         Err(error) => {
                                             // TODO: Reverse Bad position
-                                            eprintln!("{}", error.clone());
+                                            if cli.loud_error { eprintln!("Syntax: {}", error.clone()); }
+
+                                            current_status_message = Some(format!("Syntax: {}", error.clone()));
 
                                             let position = match error {
                                                 pom::Error::Incomplete => all_len,
