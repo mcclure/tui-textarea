@@ -1,4 +1,95 @@
-This branch contains experimental and personal modifications by Andi McClure. These additions have not yet been released under any open source license.
+ami
+===
+
+"Andi's Musical Instrument"(?)
+
+This branch contains experimental and personal modifications by Andi McClure. These additions have not yet been released under any open source license. To run these modifications run the "vim" example, i.e. `cargo run --example vim`.
+
+This is a small music program I wrote based on the tui-textarea "vim" code. It is intentionally designed to be used by no one on Earth but me. I have brutally sacrificed any consideration to being easy to use, or even making sense, for any other person. Notes are specified as semitone numbers because I learned music theory wrong. The frontend is vim because I know how to use vim. There is no GUI because I want to run it via ssh on a beagleboard. Some effort has been made to be mostly compatible with "regular" vim. The project is not done yet. [Here is a demonstration of it running](https://sig.grumpybumpers.com/host/amiexample.gif).
+
+## Usage
+
+### Command line
+
+When booting, these arguments are recognized:
+
+`--help` print help (and quit)  
+`--play` play song automatically at boot  
+`-e` or `--loud-error` when an error occurs, print a copy to STDERR  
+`filename` Open this filename at boot
+
+### Editing
+
+Enter or load text and then press `^P` to play the current song. (Changes to the song— either for playback, or purposes of showing errors— will not take effect until you enter Normal Mode.) To stop, press `^P` again.
+
+The following `:` commands are currently recognized; some of them are from vanilla vim:
+
+`:q` and `:wq` quit / write-and-quit  
+`:w` and `:w filename` save file  
+`:e filename` open new file  
+`:cat filename` or `:!cat filename` insert the contents of the file at the current cursor position (does not change current file)  
+`:wv filename` write the currently selected ext to a file (does not change current file)  
+`:beep` terminal bell
+
+### The language
+
+#### Notes
+
+Notes may be a positive number or the letter `x` (for a rest). The number corresponds to a number of semitones relative to the base note. Each note will be held for one beat. A note may be preceded by a number of "adjustments" (see below).
+
+The default base note is the 'A' below middle C (220 hz, or MIDI note 69). At the default tempo, one beat is a single quarter-note at 110 BPM.
+
+#### Adjustments
+
+These take "no time" and are executed immediately before the following note. In the following examples, imagine the number `2` may be replaced with any other positive number.
+
+`p22` Set base note absolutely, to [MIDI note](https://audiodev.blog/midi-note-chart/) 22 (a very low B).  
+`+2` or `p+2` Increase base note by 2 semitones.  
+`-2` or `p-2` Decrease base note by 2 semitones.  
+`++2` or `p++2` Increase base note by 2 octaves.
+`--2` or `p--2` Decrease base note by 2 octaves.
+
+`t2222` Set tempo absolutely, to 2222 samples per note (this is about 1/20th of a second).
+`t++2` Multiply (slow down) the current tempo by a factor of 2.
+`t--2` Divide (speed up) the current tempo by a factor of 2.
+
+*"Duty" refers to the percentage of the note which the note is "held down"*
+`d2` Set duty to 2 out of 8.
+`d+2` Increase duty by 2 (out of 8).
+`d-2` Decrease duty by 2 (out of 8).
+`d++2` Multiply (lengthen) the duty by a factor of 2 (out of 8).
+`d++2` Divide (shorten) the duty by a factor of (out of 8). 
+`dv9` "Duty versus"-- change the from "out of 8" to "out of 9" for the values above. (If possible, the current duty will be implicitly adjusted to be "the same".)
+
+`r` Reset all adjustments.
+
+#### Special things
+
+A word preceded by `#` will be treated as a comment and ignored.  
+A line preceded by `##` will be treated as a comment and ignored.  
+A line preceded by `!` will be treated as "init". `!` lines may only go at the beginning, and may only contain adjustments. `!` adjustments change the "reset state" that `r` returns to.
+
+#### An example
+
+```
+! t++2
+
+0 3 7 12
+t--2 +1 0 3 7 12 0 3 7 12
+r
+-1
+0 3 7 12
+d--2 ## make it choppy
+t--2 +1 0 3 7 12 0 3 7 12
+```
+
+### Caveats
+
+The program currently assumes it is running at 44100 khz. If your sound card runs at a different rate, unpredictable behavior may occur.  
+The program may currently crash.  
+Future versions of the program may massively break backward-compatibility with the current version, change names, or suddenly relocate to a different Git URL without warning.
+
+There are several programs similar to this that currently exist in a more complete state. [This one runs in your browser](https://strudel.cc/).
 
 tui-textarea
 ============

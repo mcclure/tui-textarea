@@ -1202,6 +1202,9 @@ impl Vim {
                                 },
                             }
                         },
+                        Ok(CommandLine::Beep) => {
+                            self.beep();
+                        },
                         _ => { // : syntax error // TODO: print error if any?
                             error = Some(format!("Not a command: {}", command.lines()[0].clone()));
                             self.beep(); // TODO print useful message
