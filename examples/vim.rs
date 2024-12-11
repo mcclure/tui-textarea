@@ -1111,23 +1111,35 @@ impl Vim {
                                 },
                                 (CommandLineFileOp::Write, true) => {
                                     if let Some(((from_line, from_idx), (to_line, to_idx))) = textarea.selection_range() {
-                                        // ????
-//                                        textarea.move_cursor(CursorMove::Forward); // Vim's text selection is inclusive
+                                        // Kludge: For most range ops we move forward the cursor for inclusion, but here we just made the operations inclusive
+
+                                        // Note, INCLUSIVE // How is this not in a crate somewhere already??
+                                        fn char_range(s: &String, from:usize, to:usize) -> String
+                                        {
+                                            s.chars().skip(from).take(to - from + 1).collect::<String>()
+                                        }
+                                        fn char_range_open(s: &String, from:usize) -> String
+                                        {
+                                            s.chars().skip(from).collect::<String>()
+                                        }
+                                        fn char_range_closed(s: &String, to:usize) -> String
+                                        {
+                                            s.chars().take(to+1).collect::<String>()
+                                        }
 
                                         let in_lines = textarea.lines();
                                         let mut out_lines: Vec<String> = Default::default();
-                                        // FIXME: Do we have "extract text" elsewhere?
                                         if from_line == to_line {
-                                            out_lines.push(in_lines[from_line][from_idx..=to_idx].to_string())
-                                        } else {
+                                            out_lines.push(char_range(&in_lines[from_line], from_idx, to_idx))
+                                        } else { // TODO split to line-operations.rs?
                                             for line_idx in from_line..=to_line {
-                                                let in_line = in_lines[line_idx].clone();
+                                                let in_line = &in_lines[line_idx];
                                                 if line_idx == from_line {
-                                                    out_lines.push(in_line[from_idx..].to_string());
+                                                    out_lines.push(char_range_open(in_line, from_idx));
                                                 } else if line_idx == to_line {
-                                                    out_lines.push(in_line[..=to_idx].to_string());
+                                                    out_lines.push(char_range_closed(in_line, to_idx).to_string());
                                                 } else {
-                                                    out_lines.push(in_line);
+                                                    out_lines.push(in_line.clone());
                                                 }
                                             }
                                         }
