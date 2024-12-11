@@ -15,7 +15,8 @@ When booting, these arguments are recognized:
 
 `--help` print help (and quit)  
 `--play` play song automatically at boot  
-`-e` or `--loud-error` when an error occurs, print a copy to STDERR  
+`-e` or `--print-error` when an error occurs, print a copy to STDERR  
+`-l` or `--loud-syntax` when incorrect language entered, beep  
 `filename` Open this filename at boot
 
 ### Editing
@@ -25,10 +26,10 @@ Enter or load text and then press `^P` to play the current song. (Changes to the
 The following `:` commands are currently recognized; some of them are from vanilla vim:
 
 `:q` and `:wq` quit / write-and-quit  
-`:w` and `:w filename` save file  
-`:e filename` open new file  
+`:w`, `:write`, `:write filename` or `:w filename` save file  
+`:e filename` or `:edit filename` open new file  
 `:cat filename` or `:!cat filename` insert the contents of the file at the current cursor position (does not change current file)  
-`:wv filename` write the currently selected ext to a file (does not change current file)  
+`:wv filename` or `:writevisual filename` write the currently selected text to a file (does not change current file)  
 `:beep` terminal bell
 
 ### The language

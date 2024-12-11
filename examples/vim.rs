@@ -1541,8 +1541,10 @@ async fn main() -> io::Result<()> {
     struct Cli {
         #[arg(long = "play")]
         play: bool,
-        #[arg(long = "loud-error", short='e')]
-        loud_error:bool,
+        #[arg(long = "print-error", short='e')]
+        print_error:bool,
+        #[arg(long = "loud-syntax", short='l')]
+        loud_syntax:bool,
         filename: Option<PathBuf>
     }
     let cli = Cli::parse();
@@ -1642,7 +1644,7 @@ async fn main() -> io::Result<()> {
                         let VimChanges { transition, dirty, current_file, status_message } = vim.transition(event.into(), &mut textarea, &mut command);
 
                         if status_message.is_some() {
-                            if cli.loud_error { eprintln!("{}", status_message.clone().unwrap()); }
+                            if cli.print_error { eprintln!("{}", status_message.clone().unwrap()); }
 
                             current_status_message = status_message;
                         } else if dirty {
@@ -1725,7 +1727,8 @@ async fn main() -> io::Result<()> {
                                         },
                                         Err(error) => {
                                             // TODO: Reverse Bad position
-                                            if cli.loud_error { eprintln!("Syntax: {}", error.clone()); }
+                                            if cli.print_error { eprintln!("Syntax: {}", error.clone()); }
+                                            if cli.loud_syntax { vim.beep(); }
 
                                             current_status_message = Some(format!("Syntax: {}", error.clone()));
 
