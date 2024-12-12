@@ -26,7 +26,7 @@ Enter or load text and then press `^P` to play the current song. (Changes to the
 The following `:` commands are currently recognized; some of them are from vanilla vim:
 
 `:q` and `:wq` quit / write-and-quit  
-`:new` new empty file
+`:new` new empty file  
 `:w`, `:write`, `:write filename` or `:w filename` save file  
 `:e filename` or `:edit filename` open new file  
 `:cat filename` or `:!cat filename` insert the contents of the file at the current cursor position (does not change current file)  
@@ -50,19 +50,19 @@ These take "no time" and are executed immediately before the following note. In 
 `p22` Set base note absolutely, to [MIDI note](https://audiodev.blog/midi-note-chart/) 22 (a very low B).  
 `+2` or `p+2` Increase base note by 2 semitones.  
 `-2` or `p-2` Decrease base note by 2 semitones.  
-`++2` or `p++2` Increase base note by 2 octaves.
-`--2` or `p--2` Decrease base note by 2 octaves.
+`++2` or `p++2` Increase base note by 2 octaves.  
+`--2` or `p--2` Decrease base note by 2 octaves.  
 
-`t2222` Set tempo absolutely, to 2222 samples per note (this is about 1/20th of a second).
-`t++2` Multiply (slow down) the current tempo by a factor of 2.
-`t--2` Divide (speed up) the current tempo by a factor of 2.
+`t2222` Set tempo absolutely, to 2222 samples per note (this is about 1/20th of a second).  
+`t++2` Multiply (slow down) the current tempo by a factor of 2.  
+`t--2` Divide (speed up) the current tempo by a factor of 2.  
 
-*"Duty" refers to the percentage of the note which the note is "held down"*
-`d2` Set duty to 2 out of 8.
-`d+2` Increase duty by 2 (out of 8).
-`d-2` Decrease duty by 2 (out of 8).
-`d++2` Multiply (lengthen) the duty by a factor of 2 (out of 8).
-`d++2` Divide (shorten) the duty by a factor of (out of 8). 
+*"Duty" refers to the percentage of the note which the note is "held down"*  
+`d2` Set duty to 2 out of 8.  
+`d+2` Increase duty by 2 (out of 8).  
+`d-2` Decrease duty by 2 (out of 8).  
+`d++2` Multiply (lengthen) the duty by a factor of 2 (out of 8).  
+`d--2` Divide (shorten) the duty by a factor of (out of 8).  
 `dv9` "Duty versus"-- change the from "out of 8" to "out of 9" for the values above. (If possible, the current duty will be implicitly adjusted to be "the same".)
 
 `r` Reset all adjustments.
