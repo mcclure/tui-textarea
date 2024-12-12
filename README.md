@@ -26,11 +26,14 @@ Enter or load text and then press `^P` to play the current song. (Changes to the
 The following `:` commands are currently recognized; some of them are from vanilla vim:
 
 `:q` and `:wq` quit / write-and-quit  
+`:new` new empty file
 `:w`, `:write`, `:write filename` or `:w filename` save file  
 `:e filename` or `:edit filename` open new file  
 `:cat filename` or `:!cat filename` insert the contents of the file at the current cursor position (does not change current file)  
 `:wv filename` or `:writevisual filename` write the currently selected text to a file (does not change current file)  
 `:beep` terminal bell
+
+Like in vim, `:new`, `:q` and `:e` have "force!" variants (like `:e! filename.txt`) which are required if there are unsaved changes.
 
 ### The language
 

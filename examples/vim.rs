@@ -1583,7 +1583,8 @@ async fn main() -> io::Result<()> {
     let audio_seed = AudioSeed { time: audio_time.clone(), play: audio_play.clone(), song: audio_song.clone() };
     let audio = ami_boot_audio(audio_seed);
 
-    let mut vim = Vim::new(Mode::Normal, cli.filename, false, false, VimAudioSeed { time:audio_time, play:audio_play.clone() }); // Note: time NOT cloned
+    let initial_has_filename = cli.filename.is_some(); // FIXME initial load audio handled flat-out wrong... this will make playing work after the first character input, which is not good enough
+    let mut vim = Vim::new(Mode::Normal, cli.filename, initial_has_filename, false, VimAudioSeed { time:audio_time, play:audio_play.clone() }); // Note: time NOT cloned
 
     enable_raw_mode()?;
     crossterm::execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
