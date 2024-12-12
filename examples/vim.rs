@@ -381,6 +381,7 @@ enum CommandLineFileOp {
 
 // TODO: reset, reset!, set for tones, play
 enum CommandLine {
+    New(bool), // Exclamation
     File(CommandLineFileOp, bool, String), // write?, "in-buffer"?, name
     Wqae(bool, bool, CommandLineTotality, bool), // Write, Quit, All/Buffer, Exclamation
     Help(String),
@@ -422,7 +423,9 @@ fn parse_command_line(input:String) -> Result<CommandLine, pom::Error> { // FIXM
         ).map(|(((a,b),c),d)| CommandLine::Wqae(a,b,c,d));
 
     let parser = (
-          ((seq("write").discard() | sym('w').discard())
+          (seq("new").discard() * sym('!').discard().opt()).map(|force| CommandLine::New(force.is_some()))
+
+        | ((seq("write").discard() | sym('w').discard())
             * (sym('v').discard() | seq("visual").discard()).opt()
             + space() * unspace().collect()).map(|(visual, x)| CommandLine::File(CommandLineFileOp::Write, visual.is_some(), x.to_string()))
 
@@ -456,25 +459,29 @@ struct Vim {
     mode: Mode,
     pending: Input, // Pending input to handle a sequence with two keys like gg
     current_file: Option<PathBuf>,
-    dirty: bool,
+    audio_dirty: bool, // Changed since last audio send
+    save_dirty: bool,  // Changed since last save
     audio:VimAudioSeed
 }
 
 // All changes in a single Vim transition
 struct VimChanges {
     transition:Transition,
-    dirty: bool,
+    dirty: bool,      // If newly dirty
+    save_reset: bool, // CLEARS save_dirty
+    file_reset: bool, // :new, empty all text
     current_file: Option<PathBuf>, // If it changed
     status_message: Option<String> // If it changed
 }
 
 impl Vim {
-    fn new(mode: Mode, current_file:Option<PathBuf>, dirty:bool, audio:VimAudioSeed) -> Self {
+    fn new(mode: Mode, current_file:Option<PathBuf>, audio_dirty:bool, save_dirty:bool, audio:VimAudioSeed) -> Self {
         Self {
             mode,
             pending: Input::default(),
             current_file,
-            dirty,
+            audio_dirty,
+            save_dirty,
             audio
         }
     }
@@ -530,7 +537,8 @@ impl Vim {
             mode: self.mode,
             pending,
             current_file: self.current_file,
-            dirty: self.dirty,
+            audio_dirty: self.audio_dirty,
+            save_dirty: self.save_dirty,
             audio: self.audio
         }
     }
@@ -548,7 +556,7 @@ impl Vim {
     // Result: This function should not modify vim, only provide a set of changes to apply to vim
     fn transition(&self, input: Input, textarea: &mut TextArea<'_>, command: &mut TextArea<'_>) -> VimChanges {
         const NOP:VimChanges = VimChanges {
-            transition:Transition::Nop, dirty:false, current_file:None, status_message:None
+            transition:Transition::Nop, dirty:false, save_reset:false, file_reset:false, current_file:None, status_message:None
         };
 
         if input.key == Key::Null {
@@ -1081,46 +1089,64 @@ impl Vim {
                     let line0 = command.lines()[0].clone();
                     let entry = parse_command_line(line0);
                     let mut error:Option<String> = None;
+                    const NO_WRITE:&str = "Error: No write since last change (add ! to override)";
 
                     match entry { // Notice: Currently ! not supported
-                        Ok(CommandLine::Wqae(w, q, _totality, _exclamation)) => {
+                        Ok(CommandLine::Wqae(w, q, _totality, force)) => {
                             if w {
                                 match self.save(None, textarea.lines()) {
                                     Ok(()) => {
                                         return VimChanges { transition: if q {Transition::Quit} else {Transition::Mode(Mode::Normal)}, ..NOP }
                                     }
                                     Err(e) => {
-                                        error = Some(format!("Error: Cannot w+q: {e}"));
+                                        error = Some(format!("Error: Cannot w{}: {e}", if q { "+q" } else { "rite" }));
                                         self.beep();
                                     }
                                 }
                             } else if q {
-                                return VimChanges { transition:Transition::Quit, ..NOP }; // Short circuit
+                                if self.save_dirty && !force {
+                                    error = Some(NO_WRITE.to_string());
+                                    self.beep();
+                                } else {
+                                    return VimChanges { transition:Transition::Quit, ..NOP }; // Short circuit
+                                }
                             }
                         },
+                        Ok(CommandLine::New(force)) =>
+                            if self.save_dirty && !force {
+                                error = Some(NO_WRITE.to_string());
+                                self.beep();
+                            } else {
+                                return VimChanges { transition:Transition::Mode(Mode::Normal), dirty:true, save_reset:true, file_reset:true, ..NOP }
+                            }
                         Ok(CommandLine::File(op, inline, path)) => {
                             let path = Path::new(&path).to_path_buf();
 
                             match (op, inline) {
                                 // Simple file operations
-                                (CommandLineFileOp::Read(force), false) =>
-                                    match self.load(Some(&path)) {
-                                        Ok(new_textarea) => {
-                                            *textarea = new_textarea;
-                                            return VimChanges { transition:Transition::Mode(Mode::Normal), dirty:true, current_file:Some(path), ..NOP }
+                                (CommandLineFileOp::Read(force), false) => {
+                                    if self.save_dirty && !force {
+                                        error = Some(NO_WRITE.to_string());
+                                    } else {
+                                        match self.load(Some(&path)) {
+                                            Ok(new_textarea) => {
+                                                *textarea = new_textarea;
+                                                return VimChanges { transition:Transition::Mode(Mode::Normal), dirty:true, save_reset:true, current_file:Some(path), ..NOP }
+                                            },
+                                            Err(e) => {
+                                                error = Some(format!("Error: Cannot read: {e}"));
+                                                self.beep();
+                                            }
+                                        }
+                                    }
+                                },
+                                (CommandLineFileOp::Write, false) =>
+                                    match self.save(Some(&path), textarea.lines()) {
+                                        Ok(()) => {
+                                            return VimChanges { transition:Transition::Mode(Mode::Normal), save_reset:true, current_file:Some(path), ..NOP }
                                         },
                                         Err(e) => {
                                             error = Some(format!("Error: Cannot write: {e}"));
-                                            self.beep();
-                                        }
-                                    },
-                                (CommandLineFileOp::Write, false) =>
-                                    match self.save(None, textarea.lines()) {
-                                        Ok(()) => {
-                                            return VimChanges { transition:Transition::Mode(Mode::Normal), current_file:Some(path), ..NOP }
-                                        },
-                                        Err(e) => {
-                                            error = Some(format!("Error: Cannot read: {e}"));
                                             self.beep();
                                         }
                                     },
@@ -1557,7 +1583,7 @@ async fn main() -> io::Result<()> {
     let audio_seed = AudioSeed { time: audio_time.clone(), play: audio_play.clone(), song: audio_song.clone() };
     let audio = ami_boot_audio(audio_seed);
 
-    let mut vim = Vim::new(Mode::Normal, cli.filename, false, VimAudioSeed { time:audio_time, play:audio_play.clone() }); // Note: time NOT cloned
+    let mut vim = Vim::new(Mode::Normal, cli.filename, false, false, VimAudioSeed { time:audio_time, play:audio_play.clone() }); // Note: time NOT cloned
 
     enable_raw_mode()?;
     crossterm::execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -1565,11 +1591,13 @@ async fn main() -> io::Result<()> {
     let mut term = Terminal::new(backend)?;
 
     // This will be the file edit area.
+    let init_textarea = |textarea:&mut TextArea| {
+        textarea.set_block(Mode::Normal.block());
+        textarea.set_cursor_style(Mode::Normal.cursor_style());
+        textarea.set_cursor_line_style(Style::default().bg(/*Color::DarkGray*/Color::Indexed(232) /*236 better on pure black bg*/));
+    };
     let mut textarea = vim.load(None)?;
-
-    textarea.set_block(Mode::Normal.block());
-    textarea.set_cursor_style(Mode::Normal.cursor_style());
-    textarea.set_cursor_line_style(Style::default().bg(/*Color::DarkGray*/Color::Indexed(232) /*236 better on pure black bg*/));
+    init_textarea(&mut textarea);
 
     // This is the command-line-mode :entry box, which is only sometimes visible.
     let mut command = TextArea::default();
@@ -1641,7 +1669,7 @@ async fn main() -> io::Result<()> {
                         audio_play.fetch_xor(true, Ordering::Relaxed);
                     },
                     _ => { // Mode match
-                        let VimChanges { transition, dirty, current_file, status_message } = vim.transition(event.into(), &mut textarea, &mut command);
+                        let VimChanges { transition, dirty, save_reset, file_reset, current_file, status_message } = vim.transition(event.into(), &mut textarea, &mut command);
 
                         if status_message.is_some() {
                             if cli.print_error { eprintln!("{}", status_message.clone().unwrap()); }
@@ -1652,15 +1680,26 @@ async fn main() -> io::Result<()> {
                         }
 
                         // Ugly: This code is written in a super functional style and between here and the vim = my added code just treats it as mutable
-
-                        vim.dirty = vim.dirty || dirty;
-                        vim.current_file = current_file.or(vim.current_file);
+                        if save_reset { // File op cleared save
+                            vim.save_dirty = false;
+                        } else { // Change to text dirtied save
+                            vim.save_dirty = vim.save_dirty || dirty;
+                        }
+                        if file_reset { // Requested new blank file
+                            vim.current_file = None;
+                            textarea = vim.load(None)?;
+                            init_textarea(&mut textarea);
+                        } else { // Current file changed
+                            vim.current_file = current_file.or(vim.current_file);
+                        }
+                        // Change to text dirtied audio pattern
+                        vim.audio_dirty = vim.audio_dirty || dirty;
 
                         // Throw over the wall, but ONLY if we're in normal mode *and* something changed.
                         match (transition.clone(), vim.mode) {
                             (Transition::Nop, Mode::Normal) |
                             (Transition::Mode(Mode::Normal), _) => {
-                                if vim.dirty {
+                                if vim.audio_dirty {
                                     // Completely parse buffer
                                     // TODO: Factor elsewhere
                                     let mut line_starts:Vec<usize> = Default::default(); // notice, in BYTES
@@ -1762,7 +1801,7 @@ async fn main() -> io::Result<()> {
                                         }
                                     }
 
-                                    vim.dirty = false;
+                                    vim.audio_dirty = false;
                                 }
                             },
                             _ => ()
@@ -1773,7 +1812,7 @@ async fn main() -> io::Result<()> {
                             Transition::Mode(mode) if vim.mode != mode => {
                                 textarea.set_block(mode.block());
                                 textarea.set_cursor_style(mode.cursor_style());
-                                Vim::new(mode, vim.current_file, vim.dirty, vim.audio)
+                                Vim::new(mode, vim.current_file, vim.audio_dirty, vim.save_dirty, vim.audio)
                             }
 
                             // Nothing changed
