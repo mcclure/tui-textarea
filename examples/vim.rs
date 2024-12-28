@@ -303,19 +303,12 @@ fn parse_language(input:String) -> Result<Song, pom::Error> { // FIXME: &String?
         ).name("note").with_span().map(|(span, (adjust, pitch))| Note {span, adjust, pitch})
     }
 
-    // Utility
-    fn tuple_merge<T>(t:(T, Vec<T>)) -> Vec<T> {
-        let (val, vec) = t;
-        let mut result = vec![val];
-        result.extend(vec);
-        result
-    }
-
     fn node<'a>() -> Parser<'a, Node> {
         (
-            (
-                note().map(Node::Play) + (opt_blank() * sym('&') * opt_blank() * note().map(Node::Play)).repeat(1..)
-            ).map(tuple_merge).map(Node::Fork)
+            list(
+                note().map(Node::Play),
+                opt_blank() * sym('&') * opt_blank()
+            ).map(Node::Fork)
             | note().map(Node::Play)
         ).name("node")
     }
@@ -332,8 +325,7 @@ fn parse_language(input:String) -> Result<Song, pom::Error> { // FIXME: &String?
     }
 
     fn node_list<'a>() -> Parser<'a, Vec<Node>> {
-        opt_blank() *
-                (node() + (blank() * node()).repeat(0..)).map(tuple_merge)
+        opt_blank() * list(node(), blank())
     }
 
     // TODO: parser should produce a song
@@ -343,7 +335,7 @@ fn parse_language(input:String) -> Result<Song, pom::Error> { // FIXME: &String?
             opt_space() * sym('!') * (
                 (
                     inline_opt_blank() *
-                    (adjust() + (inline_blank() * adjust()).repeat(0..)).map(tuple_merge)
+                    list(adjust(), inline_blank())
                 )
                 | inline_opt_blank().map(|_|vec![])
             ) - sym('\n')
