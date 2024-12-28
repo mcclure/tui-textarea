@@ -151,8 +151,8 @@ impl<'a, O: 'a> WithSpan<'a, O> for pom::utf8::Parser<'a, O> {
 // dNumber, d+Number, d++Number etc: set duty/duration (against basis of 8)
 // a&b: One, then the other
 
-// TODOs/document: pv, dv; !
-// TODOs/consider: pr, dr; &&, &&&; !!; #, ##; :;
+// TODOs/document: pv, dv; !; #, ##;
+// TODOs/consider: pr, dr; &&, &&&; !!; :;
 
 // In comments below: An //AT comment implies audio thread only, a //PT comment implies processing thread only
 // There are two forms of this AST, a "raw" form and a "clean" form, but they have the same type.
@@ -192,12 +192,14 @@ struct Note {
 #[derive(Debug, Clone)]
 enum Node {
     Play(Note),
-    Fork(Vec<Node>)
+    Call(u8), // Goto proc
+    Fork(Vec<Node>), // NOT IMPLEMENTED // TODO: Preferable if adjustments live outside fork
 }
 
 #[derive(Default, Debug, Clone)]
 struct Song {
     prefix: Vec<Adjust>, // TODO consider tinyvec
+    procs: [Vec<Node>; 26],
     score: Vec<Node>
 }
 
@@ -259,6 +261,10 @@ fn parse_language(input:String) -> Result<Song, pom::Error> { // FIXME: &String?
             .name("positive")
     }
 
+    fn proc_name<'a>() -> Parser<'a, u8> {
+        one_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ").map(|ch| (ch as u32 - 'A' as u32) as u8)
+    }
+
     // Compound tokens
 
     fn act<'a>(set:bool) -> Parser<'a, Act> {
@@ -314,10 +320,25 @@ fn parse_language(input:String) -> Result<Song, pom::Error> { // FIXME: &String?
         ).name("node")
     }
 
-//    let upper = one_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+    // Utility
+    // TODO: Learn to fail
+    fn sort_procs(vv: Vec<(u8, Vec<Node>)>) -> [Vec<Node>; 26] {
+        let mut procs: [Vec<Node>; 26] = Default::default();
+        for (name, v) in vv {
+//            if procs[name as usize].size() > 0 { return Err() }
+            procs[name as usize] = v;
+        }
+        procs
+    }
+
+    fn node_list<'a>() -> Parser<'a, Vec<Node>> {
+        opt_blank() *
+                (node() + (blank() * node()).repeat(0..)).map(tuple_merge)
+    }
 
     // TODO: parser should produce a song
     let parser =
+        // Init adjustments
         (
             opt_space() * sym('!') * (
                 (
@@ -328,15 +349,16 @@ fn parse_language(input:String) -> Result<Song, pom::Error> { // FIXME: &String?
             ) - sym('\n')
         ).repeat(0..).map(|v|v.into_iter().flatten().collect()) +
         (
-            (
-                opt_blank() *
-                (node() + (blank() * node()).repeat(0..)).map(tuple_merge) - opt_blank()
-            )
+            opt_space() * sym('(') * ( proc_name() + node_list() )
+            - sym(')')
+        ).repeat(0..).map(sort_procs) +
+        (
+            (node_list() - opt_blank())
             | opt_blank().map(|_|vec![]) // Empty file is valid
         )
         - end()
     ;
-    parser.map(|(prefix, score)|Song {prefix, score}).parse_str(&input)
+    parser.map(|((prefix, procs), score)|Song {prefix, procs, score}).parse_str(&input)
 }
 
 // Translate PT to AT
@@ -357,7 +379,7 @@ fn absolute_language(s:Song) -> Song {
     }
 
     // Todo: Surf prefix for note offsets
-    Song{prefix:s.prefix, score:s.score.into_iter().map(absolute_node).collect()}
+    Song{prefix:s.prefix, procs:s.procs, score:s.score.into_iter().map(absolute_node).collect()}
 }
 
 // Command line parser
