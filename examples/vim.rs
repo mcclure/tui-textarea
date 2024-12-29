@@ -303,12 +303,21 @@ fn parse_language(input:String) -> Result<Song, pom::Error> { // FIXME: &String?
         ).name("note").with_span().map(|(span, (adjust, pitch))| Note {span, adjust, pitch})
     }
 
+    // Utility
+    fn require_overone<T>(v:Vec<T>) -> pom::Result<Vec<T>> {
+        if v.len() > 1 {
+            Ok(v)
+        } else {
+            Err(pom::Error::Incomplete)
+        }
+    }
+
     fn node<'a>() -> Parser<'a, Node> {
         (
             list(
                 note().map(Node::Play),
                 opt_blank() * sym('&') * opt_blank()
-            ).map(Node::Fork)
+            ).convert(require_overone).map(Node::Fork)
             | note().map(Node::Play)
         ).name("node")
     }
