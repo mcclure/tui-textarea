@@ -183,24 +183,24 @@ enum Pitch {
 }
 
 #[derive(Debug, Clone)]
-struct Note {
-    span: ByteSpan,
-    adjust: Vec<Adjust>, // No adjustments -> vec len 0
-    pitch: Pitch,        // "Note value", may not correpsond to pitch per se
+enum NotePayload {
+    Play(Pitch),
+    Call(u8), // Goto proc
+    Fork(Vec<NotePayload>), // NOT IMPLEMENTED
 }
 
 #[derive(Debug, Clone)]
-enum Node {
-    Play(Note),
-    Call(u8), // Goto proc
-    Fork(Vec<Node>), // NOT IMPLEMENTED // TODO: Preferable if adjustments live outside fork
+struct Note {
+    span: ByteSpan,
+    adjust: Vec<Adjust>, // No adjustments -> vec len 0
+    payload:NotePayload,        // "Note value", may not correpsond to pitch per se
 }
 
 #[derive(Default, Debug, Clone)]
 struct Song {
     prefix: Vec<Adjust>, // TODO consider tinyvec
-    procs: [Vec<Node>; 26],
-    score: Vec<Node>
+    procs: [Vec<Note>; 26],
+    score: Vec<Note>
 }
 
 // - TODO: Do the "name" args serve a purpose? Do they create perf issues? Should they be commented out?
@@ -297,35 +297,41 @@ fn parse_language(input:String) -> Result<Song, pom::Error> { // FIXME: &String?
         ).name("pitch")
     }
 
-    fn note<'a>() -> Parser<'a, Note> { // TODO: Collapse Option<Vec<Adjust>> into Vec<Adjust> and use 0..?
-        (
-            (adjust() - blank()).repeat(0..) + note_pitch()
-        ).name("note").with_span().map(|(span, (adjust, pitch))| Note {span, adjust, pitch})
-    }
-
     // Utility
-    fn require_overone<T>(v:Vec<T>) -> pom::Result<Vec<T>> {
-        if v.len() > 1 {
+    fn require_one<T>(v:Vec<T>) -> pom::Result<Vec<T>> { // TODO: Collapse with map below? Only used once
+        if v.len() > 0 {
             Ok(v)
         } else {
             Err(pom::Error::Incomplete)
         }
     }
 
-    fn node<'a>() -> Parser<'a, Node> {
+    fn note_payload<'a>() -> Parser<'a, NotePayload> {
         (
             list(
-                note().map(Node::Play),
+                note_pitch().map(NotePayload::Play)
+                | proc_name().map(NotePayload::Call),
                 opt_blank() * sym('&') * opt_blank()
-            ).convert(require_overone).map(Node::Fork)
-            | note().map(Node::Play)
+            ).convert(require_one).map(|v|
+                if v.len() > 1 {
+                    NotePayload::Fork(v)
+                } else {
+                    v.into_iter().next().unwrap() // Destroy vector and extract single element
+                }
+            )
         ).name("node")
+    }
+
+    fn note<'a>() -> Parser<'a, Note> { // TODO: Collapse Option<Vec<Adjust>> into Vec<Adjust> and use 0..?
+        (
+            (adjust() - blank()).repeat(0..) + note_payload()
+        ).name("note").with_span().map(|(span, (adjust, payload))| Note {span, adjust, payload})
     }
 
     // Utility
     // TODO: Learn to fail
-    fn sort_procs(vv: Vec<(u8, Vec<Node>)>) -> [Vec<Node>; 26] {
-        let mut procs: [Vec<Node>; 26] = Default::default();
+    fn sort_procs(vv: Vec<(u8, Vec<Note>)>) -> [Vec<Note>; 26] {
+        let mut procs: [Vec<Note>; 26] = Default::default();
         for (name, v) in vv {
 //            if procs[name as usize].size() > 0 { return Err() }
             procs[name as usize] = v;
@@ -333,8 +339,8 @@ fn parse_language(input:String) -> Result<Song, pom::Error> { // FIXME: &String?
         procs
     }
 
-    fn node_list<'a>() -> Parser<'a, Vec<Node>> {
-        opt_blank() * list(node(), blank())
+    fn node_list<'a>() -> Parser<'a, Vec<Note>> {
+        opt_blank() * list(note(), blank())
     }
 
     // TODO: parser should produce a song
@@ -363,7 +369,8 @@ fn parse_language(input:String) -> Result<Song, pom::Error> { // FIXME: &String?
 }
 
 // Translate PT to AT
-fn absolute_language(s:Song) -> Song {
+/*
+fn filter_language(s:Song) -> Song {
     fn absolute_node(node:Node) -> Node {
         // TODO: I don't want this anymore. I do want () scanned
         // match node {
@@ -382,6 +389,7 @@ fn absolute_language(s:Song) -> Song {
     // Todo: Surf prefix for note offsets
     Song{prefix:s.prefix, procs:s.procs, score:s.score.into_iter().map(absolute_node).collect()}
 }
+*/
 
 // Command line parser
 
@@ -1300,10 +1308,18 @@ where
     }
 }
 
+// TODO: Add a feature for earlier failures
 fn audio_run<T>(device: &cpal::Device, config: &cpal::StreamConfig, audio_additional:AudioSeed) -> Result<cpal::Stream, CpalError>
 where
     T: SizedSample + FromSample<f32> + bytemuck::Pod, /* Pod constraint can be removed without audio_log */
 {
+    // Constants for audio engine
+    const BPM:i32 = 110;
+    const SQUARE_RADIX:i32 = 32; // "Subsample" fixed point for better pitch accuracy
+    const DEFAULT_RATE:i32 = (60.0*48000.0/(BPM as f64)/4.0) as i32;
+
+    const STACK_LIMIT:usize = 4;
+
     // Types for audio engine
     #[derive(Debug, Clone)]
     struct AdjustState {
@@ -1314,6 +1330,12 @@ where
         duty_vs:i32,     // Radix of duty (scalar)
         duty_as_sample_cache:i32, // duty converted to samples
     }
+
+    const DEFAULT_ADJUST:AdjustState = AdjustState {
+        root:69-12, pitch:0, rate:DEFAULT_RATE, duty:8, duty_vs:8, duty_as_sample_cache:DEFAULT_RATE
+    };
+    impl Default for AdjustState { fn default() -> Self { DEFAULT_ADJUST } }
+
     #[derive(Debug, Clone)]
     struct PlayState {
         // TODO Separate? Traits?
@@ -1321,29 +1343,46 @@ where
         synth_high:bool,    // Is square high?
 
         sample_at:i32,      // Progress within beat (samples)
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct SeqState {
+        adjust:AdjustState,
+
+        proc: Option<usize>, // A-Z or none
         beat_at:usize,        // Beat ('song.score' index)
     }
+
     #[derive(Debug, Clone)]
     struct State { // TODO rename "frame"?
         // TODO: CoreState with pitch_vs, rate_vs?
-        adjust:AdjustState,
+        seq:tinyvec::ArrayVec<[SeqState; STACK_LIMIT]>,
         play:PlayState
     }
+    impl State {
+        fn seq_state(&self) -> &SeqState { self.seq.last().unwrap() }
+        fn seq_state_mut(&mut self) -> &mut SeqState { self.seq.last_mut().unwrap() }
+        fn seq_state_mut_play(&mut self) -> (&mut SeqState, &mut PlayState) { (self.seq.last_mut().unwrap(), &mut self.play) }
+    }
 
-    // Constants for audio engine
-    const BPM:i32 = 110;
-    const SQUARE_RADIX:i32 = 32; // "Subsample" fixed point for better pitch accuracy
-    const REST_NODE:Node = Node::Play(Note { span: ByteSpan { begin:0, end:0 }, adjust: vec![], pitch: Pitch::Abs(0) });
-    const DEFAULT_RATE:i32 = (60.0*48000.0/(BPM as f64)/4.0) as i32;
-    const DEFAULT_ADJUST:AdjustState = AdjustState {
-        root:69-12, pitch:0, rate:DEFAULT_RATE, duty:8, duty_vs:8, duty_as_sample_cache:DEFAULT_RATE
-    };
+    const REST_NOTE:Note = Note { span: ByteSpan { begin:0, end:0 }, adjust: vec![], payload: NotePayload::Play(Pitch::Abs(0)) };
+
     const DEFAULT_PLAY:PlayState = PlayState {
-        synth_at: 0, synth_high:false, sample_at:0, beat_at:0
+        synth_at: 0, synth_high:false, sample_at:0
     };
 
     fn fit_range(x:i32) -> i32 {
         x.clamp(0,127)
+    }
+
+    // Second return value "is proc"
+    fn playing_score<'a>(state:&State, song:&'a Song) -> (&'a Vec<Note>, bool) {
+        let seq_state = state.seq_state();
+        if let Some(proc) = seq_state.proc {
+            (&song.procs[proc], true)
+        } else {
+            (&song.score, false)
+        }
     }
 
     fn do_adjust(v:&Vec<Adjust>, state:&mut AdjustState, default:&AdjustState) {
@@ -1397,7 +1436,9 @@ where
 //    let sample_rate = config.sample_rate.0 as f32;
     let channels = config.channels as usize;
     let mut reset_adjust = DEFAULT_ADJUST;
-    let mut state = State {adjust: DEFAULT_ADJUST, play: DEFAULT_PLAY};
+    let mut state = State {seq: Default::default(), play: DEFAULT_PLAY};
+    state.seq.push(Default::default());
+    // TODO: Adjust on frame 0-- we are only loading adjustments on need_adjustment
 
     // Copy cross thread values into closure
     let audio_time = audio_additional.time.clone();
@@ -1406,7 +1447,7 @@ where
 
     // Can't have an empty song, so make a default one containing a single rest.
     let mut song:Song = Default::default();
-    song.score.push(REST_NODE);
+    song.score.push(REST_NOTE);
 
     // Lookup table of MIDI note -> subsample zero-crossing period of square wave
     let notes = {
@@ -1443,75 +1484,114 @@ where
 
             reset_adjust = DEFAULT_ADJUST;
             do_adjust(&song.prefix, &mut reset_adjust, &DEFAULT_ADJUST);
-            state.adjust = reset_adjust.clone();
+            // TODO: Swap instead of clear and carry across state
+            state.seq.clear();
+            state.seq.push(Default::default());
+            state.seq[0].adjust = reset_adjust.clone();
 
             if song.score.len() == 0 {
-                song.score.push(REST_NODE);
+                song.score.push(REST_NOTE);
             }
         }
 
-        // Check for end of note
+        // True if we are focused on a different note than we were before.
         let mut need_adjustment = false;
-        if state.play.sample_at > state.adjust.rate {
-            state.play.beat_at += 1;
-            state.play.sample_at = 0;
+        // Check for end of note
+        {
+            let (seq_state, play) = state.seq_state_mut_play();
+            if play.sample_at > seq_state.adjust.rate {
+                seq_state.beat_at += 1;
+                play.sample_at = 0;
 
-            // Cancel out square wave "overrun" (already dubious)
-            if state.adjust.duty < state.adjust.duty_vs {
-                state.play.synth_at = 0;
-                state.play.synth_high = !state.play.synth_high;
+                // Cancel out square wave "overrun" (already dubious)
+                if seq_state.adjust.duty < seq_state.adjust.duty_vs {
+                    state.play.synth_at = 0;
+                    state.play.synth_high = !state.play.synth_high;
+                }
+
+                need_adjustment = true;
             }
-
-            need_adjustment = true;
         }
-        // Check for end of song (loop)
+        // Check for end of song/proc (loop/unroll)
         // Do this outside previous if because song can be replaced "under us"
-        if state.play.beat_at >= song.score.len() {
-            state.play.beat_at = 0;
+        {
+            #[derive(PartialEq)] enum Roll { Done, Unroll, Loop }
+            loop {
+                let roll = {
+                    let (score, is_proc) = playing_score(&state, &song);
+                    let seq_state = state.seq_state();
+                    if seq_state.beat_at >= score.len() {
+                        if is_proc { Roll::Unroll } else { Roll::Loop }
+                    } else {
+                        Roll::Done
+                    }
+                };
+                if roll == Roll::Done { break; }
+                if roll == Roll::Loop {
+                    let seq_state = state.seq_state_mut();
+                    seq_state.beat_at = 0;
 
-            // FIXME: File a bug on what happens with this next line if you remove clone()
-            state.adjust = reset_adjust.clone(); // Implicit reset each loop. Consider making customizable?
-            need_adjustment = true;
+                    // FIXME: File a bug on Rust on what happens with this next line if you remove clone()?
+                    seq_state.adjust = reset_adjust.clone(); // Implicit reset each loop. Consider making customizable?
+                    need_adjustment = true;
+
+                    break;
+                }
+                // roll == Roll::Unroll (pick a layer off seq, incement it, loop)
+                state.seq.pop();
+                state.seq_state_mut().beat_at += 1;
+                need_adjustment = true;
+            }
         }
 
         // What note are we playing?
-        // FIXME: There are bugs here:
-        // - pitch adjustments always apply relative to 69-12 rather than current value.
-        // - tempo adjustments tend to result in the note being skipped, somehow.
-        let note = &song.score[state.play.beat_at];
-        if need_adjustment {
-            match &song.score[state.play.beat_at] {
-                Node::Play(Note {adjust:v, ..}) => {
-                    do_adjust(v, &mut state.adjust, &reset_adjust);
-                },
+        loop {
+            let (score, _) = playing_score(&state, &song);
+            let (seq_state, play) = state.seq_state_mut_play();
+
+            let note = &score[seq_state.beat_at];
+            if need_adjustment {
+                match &score[seq_state.beat_at] {
+                    Note {adjust:v, ..} => {
+                        do_adjust(v, &mut seq_state.adjust, &reset_adjust);
+                    },
+                    _ => unreachable!()
+                }
+                if let NotePayload::Call(idx) = &score[seq_state.beat_at].payload {
+                    let mut seq_state = seq_state.clone();
+                    seq_state.proc = Some(*idx as usize);
+                    seq_state.beat_at = 0;
+                    state.seq.push(seq_state);
+                    // Note: need_adjustment still true
+                    continue;
+                }
+            }
+
+            let pitch_index = match &score[seq_state.beat_at].payload {
+                NotePayload::Play(Pitch::Abs(x)) => fit_range(*x), // Never generated?
+                NotePayload::Play(Pitch::Rel(x)) => fit_range(*x + seq_state.adjust.root),
+                NotePayload::Play(Pitch::Rest) => 0,
                 _ => unreachable!()
+            };
+            // Map note->synth zero crossing peroid
+            let period = notes[pitch_index as usize];
+
+            // Time for synth zero crossing?
+            if play.sample_at < seq_state.adjust.duty_as_sample_cache && play.synth_at > period {
+                play.synth_high = !play.synth_high;
+                play.synth_at -= period;
+            }
+
+            // Tell the processing thread where we're at
+            audio_time.store(seq_state.beat_at as u32, Ordering::Relaxed);
+
+            // Play sound
+            if state.play.synth_high {
+                return 0.25
+            } else {
+                return 0.0 // TODO: This won't work with mixing. Fix zero_value below
             }
         }
-        let pitch_index = match &song.score[state.play.beat_at] {
-            Node::Play(Note { pitch:Pitch::Abs(x), ..}) => fit_range(*x), // Never generated?
-            Node::Play(Note { pitch:Pitch::Rel(x), ..}) => fit_range(*x + state.adjust.root),
-            Node::Play(Note { pitch:Pitch::Rest, ..}) => 0,
-            _ => unreachable!()
-        };
-        // Map note->synth zero crossing peroid
-        let period = notes[pitch_index as usize];
-
-        // Time for synth zero crossing?
-        if state.play.sample_at < state.adjust.duty_as_sample_cache && state.play.synth_at > period {
-            state.play.synth_high = !state.play.synth_high;
-            state.play.synth_at -= period;
-        }
-
-        // Tell the processing thread where we're at
-        audio_time.store(state.play.beat_at as u32, Ordering::Relaxed);
-
-        // Play sound
-        if state.play.synth_high {
-            0.25
-        } else {
-            0.0 // TODO: This won't work with mixing. Fix zero_value below
-        }
-        // -- BOILERPLATE --
     };
 
     let mut zero_value = || { 0.0 };
@@ -1743,9 +1823,6 @@ async fn main() -> io::Result<()> {
 
                                     match song {
                                         Ok(song) => {
-                                            // I *think* I don't need SeqCst because only one thread writes?
-                                            let song = absolute_language(song);
-
                                             // Calculate highlights map
                                             {
                                                 let mut line_at = 0;
@@ -1753,9 +1830,9 @@ async fn main() -> io::Result<()> {
                                                 let mut chars:Option<std::str::Chars> = None;
                                                 let lines = &textarea.lines();
                                                 song_highlights.clear();
-                                                for node in &song.score {
-                                                    match node {
-                                                        Node::Play(Note { span:ByteSpan { begin, end }, ..}) => {
+                                                for note in &song.score {
+                                                    match note {
+                                                        Note { span:ByteSpan { begin, end }, ..} => {
                                                             use tuple_map::*;
                                                             song_highlights.push((begin,end).map(|idx| {
                                                                 let idx = *idx;
