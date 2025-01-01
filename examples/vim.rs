@@ -1357,7 +1357,8 @@ where
     struct State { // TODO rename "frame"?
         // TODO: CoreState with pitch_vs, rate_vs?
         seq:tinyvec::ArrayVec<[SeqState; STACK_LIMIT]>,
-        play:PlayState
+        play:PlayState,
+        boot:bool // "is this the first sample"?
     }
     impl State {
         fn seq_state(&self) -> &SeqState { self.seq.last().unwrap() }
@@ -1436,7 +1437,7 @@ where
 //    let sample_rate = config.sample_rate.0 as f32;
     let channels = config.channels as usize;
     let mut reset_adjust = DEFAULT_ADJUST;
-    let mut state = State {seq: Default::default(), play: DEFAULT_PLAY};
+    let mut state = State {seq: Default::default(), play: DEFAULT_PLAY, boot: true};
     state.seq.push(Default::default());
     // TODO: Adjust on frame 0-- we are only loading adjustments on need_adjustment
 
@@ -1495,7 +1496,9 @@ where
         }
 
         // True if we are focused on a different note than we were before.
-        let mut need_adjustment = false;
+        let mut need_adjustment = state.boot;
+        state.boot = false;
+
         // Check for end of note
         {
             let (seq_state, play) = state.seq_state_mut_play();
