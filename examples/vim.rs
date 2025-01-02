@@ -104,6 +104,20 @@ enum Transition {
 }
 
 // For ami
+
+const PLAYBACK_STACK_LIMIT:usize = 4;
+
+#[derive(Debug, Clone)]
+struct SpanIndex {
+    score:usize,
+    note:usize
+}
+
+struct VimAudioPlaybackStatus {
+    playing:[Option<SpanIndex>;PLAYBACK_STACK_LIMIT],
+    time:u32
+}
+
 struct VimAudioSeed {
     time: std::sync::Arc<AtomicU32>,
     play: std::sync::Arc<AtomicBool>,
@@ -189,9 +203,16 @@ enum NotePayload {
     Fork(Vec<NotePayload>), // NOT IMPLEMENTED
 }
 
+// The parser creates according to Byte standard, it is adjusted to Index in a second step
+#[derive(Debug, Clone)]
+enum NoteSpan {
+    Byte(ByteSpan),
+    Index(SpanIndex)
+}
+
 #[derive(Debug, Clone)]
 struct Note {
-    span: ByteSpan,
+    span: NoteSpan,
     adjust: Vec<Adjust>, // No adjustments -> vec len 0
     payload:NotePayload,        // "Note value", may not correpsond to pitch per se
 }
@@ -325,7 +346,7 @@ fn parse_language(input:String) -> Result<Song, pom::Error> { // FIXME: &String?
     fn note<'a>() -> Parser<'a, Note> { // TODO: Collapse Option<Vec<Adjust>> into Vec<Adjust> and use 0..?
         (
             (adjust() - blank()).repeat(0..) + note_payload()
-        ).name("note").with_span().map(|(span, (adjust, payload))| Note {span, adjust, payload})
+        ).name("note").with_span().map(|(span, (adjust, payload))| Note {span:NoteSpan::Byte(span), adjust, payload})
     }
 
     // Utility
@@ -369,27 +390,39 @@ fn parse_language(input:String) -> Result<Song, pom::Error> { // FIXME: &String?
 }
 
 // Translate PT to AT
-/*
-fn filter_language(s:Song) -> Song {
-    fn absolute_node(node:Node) -> Node {
-        // TODO: I don't want this anymore. I do want () scanned
-        // match node {
-        //     Node::Play((adjust, pitch)) => {
-        //         Node::Play((adjust, match pitch {
-        //             Pitch::Rest => Pitch::Abs(0),
-        //             Pitch::Rel(x) => Pitch::Abs(fit_range(x + 69 - 12)), // TODO: Remove -12 when it's easier to shift octave
-        //             Pitch::Abs(x) => Pitch::Abs(fit_range(x))
-        //         }))
-        //     },
-        //     Node::Fork(all) => Node::Fork(all.into_iter().map(absolute_node).collect())
-        // }
-        node
-    }
+// Note: Consumes song
+fn respan_language(s:Song, lines:&[String], song_highlights:&mut Vec<TextRange>) -> Song {
+    let mut line_at = 0;
+    let mut char_at = 0;
+    let mut chars:Option<std::str::Chars> = None;
+    song_highlights.clear();
+    // TODO adapt from line 1861
 
-    // Todo: Surf prefix for note offsets
-    Song{prefix:s.prefix, procs:s.procs, score:s.score.into_iter().map(absolute_node).collect()}
+    use std::collections::HashMap; // Overkill but who cares
+    let mut letter_index: HashMap<u8, usize> = Default::default();
+    letter_index.reserve(26);
+    fn recurse(n: Note, letter_index: HashMap<u8, usize>) {
+
+    }
+    let prefix = s.prefix;
+    let procs = {
+        let mut count = 0;
+        s.procs.map(|v| {
+            let letter_count = letter_index.len();
+            let v = if v.len() > 0 {
+                letter_index.insert(count as u8, letter_count);
+                v.into_iter().map(|n| n).collect()
+            } else {
+                v
+            };
+            count += 1;
+            v
+        })
+    };
+    let score = s.score.into_iter().collect();
+    Song {prefix, procs, score}
 }
-*/
+
 
 // Command line parser
 
@@ -1318,8 +1351,6 @@ where
     const SQUARE_RADIX:i32 = 32; // "Subsample" fixed point for better pitch accuracy
     const DEFAULT_RATE:i32 = (60.0*48000.0/(BPM as f64)/4.0) as i32;
 
-    const STACK_LIMIT:usize = 4;
-
     // Types for audio engine
     #[derive(Debug, Clone)]
     struct AdjustState {
@@ -1356,7 +1387,7 @@ where
     #[derive(Debug, Clone)]
     struct State { // TODO rename "frame"?
         // TODO: CoreState with pitch_vs, rate_vs?
-        seq:tinyvec::ArrayVec<[SeqState; STACK_LIMIT]>,
+        seq:tinyvec::ArrayVec<[SeqState; PLAYBACK_STACK_LIMIT]>,
         play:PlayState,
         boot:bool // "is this the first sample"?
     }
@@ -1366,7 +1397,7 @@ where
         fn seq_state_mut_play(&mut self) -> (&mut SeqState, &mut PlayState) { (self.seq.last_mut().unwrap(), &mut self.play) }
     }
 
-    const REST_NOTE:Note = Note { span: ByteSpan { begin:0, end:0 }, adjust: vec![], payload: NotePayload::Play(Pitch::Abs(0)) };
+    const REST_NOTE:Note = Note { span: NoteSpan::Byte(ByteSpan { begin:0, end:0 }), adjust: vec![], payload: NotePayload::Play(Pitch::Abs(0)) };
 
     const DEFAULT_PLAY:PlayState = PlayState {
         synth_at: 0, synth_high:false, sample_at:0
@@ -1831,11 +1862,11 @@ async fn main() -> io::Result<()> {
                                                 let mut line_at = 0;
                                                 let mut char_at = 0;
                                                 let mut chars:Option<std::str::Chars> = None;
-                                                let lines = &textarea.lines();
+                                                let lines = textarea.lines();
                                                 song_highlights.clear();
                                                 for note in &song.score {
                                                     match note {
-                                                        Note { span:ByteSpan { begin, end }, ..} => {
+                                                        Note { span:NoteSpan::Byte(ByteSpan { begin, end }), ..} => {
                                                             use tuple_map::*;
                                                             song_highlights.push((begin,end).map(|idx| {
                                                                 let idx = *idx;
