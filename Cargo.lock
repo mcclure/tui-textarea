@@ -2317,6 +2317,7 @@ dependencies = [
  "crossterm 0.25.0",
  "crossterm 0.28.1",
  "futures",
+ "image",
  "pom",
  "ratatui",
  "ratatui-image",

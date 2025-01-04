@@ -15,6 +15,9 @@ use std::path::{Path, PathBuf};
 use std::io::BufRead;
 use tui_textarea::{CursorMove, Input, Key, Scrolling, TextArea};
 
+// For orb
+use ratatui_image::{picker::Picker, StatefulImage, protocol::StatefulProtocol};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Normal,
@@ -277,8 +280,7 @@ async fn main() -> io::Result<()> {
     }
     let cli = Cli::parse();
 
-    let stdout = io::stdout();
-    let mut stdout = stdout.lock();
+    let mut stdout = io::stdout().lock();
 
     let mut vim = Vim::new(Mode::Normal);
 
@@ -310,6 +312,15 @@ async fn main() -> io::Result<()> {
     let mut events = crossterm::event::EventStream::new();
     let mut should_quit = false;
 
+    let mut picker = Picker::from_query_stdio().unwrap();
+    let (iheight, iwidth) = (64, 64);
+    let mut data:Vec<u8> = Default::default();
+    for y in 0..iheight { for x in 0..iwidth {
+        data.push(x*4); data.push(y*4); data.push(0);
+    } }
+    let raw_image = image::DynamicImage::ImageRgb8(image::ImageBuffer::from_raw(iwidth as u32, iheight as u32, data).unwrap());
+    let mut image = picker.new_protocol(raw_image, ratatui::layout::Rect::new( 0, 0, iwidth as u16, iheight as u16), ratatui_image::Resize::Crop(None)).unwrap();
+
     // Extra GUI state
     let mut current_status_message: Option<String> = None;
 
@@ -320,7 +331,8 @@ async fn main() -> io::Result<()> {
             _ = interval.tick() => {
 
                 term.draw(|f| {
-//                    f.render_widget(&textarea, f.area());
+                    f.render_widget(ratatui_image::Image::new(&mut image), f.area());
+//                    f.render_stateful_widget(StatefulImage::default(), f.area(), &mut image);
                     let mut bottom_line_area = f.area();
                     bottom_line_area.y = bottom_line_area.height-1;
                     bottom_line_area.height=1;
