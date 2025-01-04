@@ -280,6 +280,8 @@ async fn main() -> io::Result<()> {
     }
     let cli = Cli::parse();
 
+    let picker = Picker::from_query_stdio().unwrap(); // Must do this before stdout lock
+
     let mut stdout = io::stdout().lock();
 
     let mut vim = Vim::new(Mode::Normal);
@@ -312,7 +314,6 @@ async fn main() -> io::Result<()> {
     let mut events = crossterm::event::EventStream::new();
     let mut should_quit = false;
 
-    let mut picker = Picker::from_query_stdio().unwrap();
     let (iheight, iwidth) = (64, 64);
     let mut data:Vec<u8> = Default::default();
     for y in 0..iheight { for x in 0..iwidth {
