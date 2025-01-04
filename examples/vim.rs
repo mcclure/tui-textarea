@@ -16,7 +16,7 @@ use std::io::BufRead;
 use tui_textarea::{CursorMove, Input, Key, Scrolling, TextArea};
 
 // For orb
-use ratatui_image::{picker::Picker, StatefulImage, protocol::StatefulProtocol};
+use ratatui_image::{picker::Picker, StatefulImage, protocol::Protocol}; // todo: protocol::StatefulProtocol
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -314,13 +314,49 @@ async fn main() -> io::Result<()> {
     let mut events = crossterm::event::EventStream::new();
     let mut should_quit = false;
 
-    let (iheight, iwidth) = (64, 64);
-    let mut data:Vec<u8> = Default::default();
-    for y in 0..iheight { for x in 0..iwidth {
-        data.push(x*4); data.push(y*4); data.push(0);
-    } }
-    let raw_image = image::DynamicImage::ImageRgb8(image::ImageBuffer::from_raw(iwidth as u32, iheight as u32, data).unwrap());
-    let mut image = picker.new_protocol(raw_image, ratatui::layout::Rect::new( 0, 0, iwidth as u16, iheight as u16), ratatui_image::Resize::Crop(None)).unwrap();
+    // ORB TECHNOLOGY
+
+    // frame-width-in-blocks, frame-height-in-blocks, internal-width-of-block-in-pixels, internal-height-of-block-in-pixels
+    type SizeQuad = (u16, u16, u16, u16);
+
+    struct Orb {
+        size: SizeQuad,
+        pub protocol: Protocol
+    };
+
+    impl Orb {
+        fn new_with(size:SizeQuad, protocol:Protocol) -> Self {
+            Orb { size, protocol }
+        }
+        pub fn new(picker:&Picker, size:SizeQuad) -> Self {
+            let protocol = {
+                let (frame_width, frame_height, pixel_width, pixel_height) = {
+                    let (fw, fh, iw, ih) = size;
+                    (fw as u32, fh as u32, fw as u32*iw as u32, fh as u32*ih as u32)
+                };
+                let mut data:Vec<u8> = Default::default();
+
+                for y in 0..pixel_height {
+                    for x in 0..pixel_width {
+                        data.push((x*255/pixel_width) as u8);
+                        data.push((y*255/pixel_height) as u8);
+                        data.push(((x+y)%2) as u8 * 255);
+                    }
+                }
+                //eprintln!("{pixel_width},{pixel_height} > {frame_width},{frame_height} ... {}", data.len());
+
+                let raw_image = image::DynamicImage::ImageRgb8(image::ImageBuffer::from_raw(pixel_width, pixel_height, data).unwrap());
+                picker.new_protocol(raw_image, ratatui::layout::Rect::new( 0, 0, frame_width as u16, frame_height as u16), ratatui_image::Resize::Crop(None)).unwrap()
+            };
+            Self::new_with(size, protocol)
+        }
+        pub fn resize(&mut self, picker:&Picker, size:SizeQuad) {
+            if size != self.size {
+                *self = Self::new(picker, size);
+            }
+        }
+    }
+    let mut orb:Option<Orb> = None;
 
     // Extra GUI state
     let mut current_status_message: Option<String> = None;
@@ -332,9 +368,29 @@ async fn main() -> io::Result<()> {
             _ = interval.tick() => {
 
                 term.draw(|f| {
-                    f.render_widget(ratatui_image::Image::new(&mut image), f.area());
+                    let area = f.area();
+
+                    {
+                        let mut image_area = area;
+                        image_area.height -= 1;
+
+                        let (iw, ih) = picker.font_size();
+                        let (fw, fh) = (image_area.width, image_area.height);
+                        let size = (fw, fh, iw, ih);
+                        if let Some(orb) = orb.as_mut() {
+                            orb.resize(&picker, size);
+                        } else {
+                            orb = Some(Orb::new(&picker, size));
+                        }
+                        if let Some(orb) = orb.as_mut() {
+                            f.render_widget(ratatui_image::Image::new(&mut orb.protocol), f.area());
+                        } else {
+                            unreachable!();
+                        }
+                    }
 //                    f.render_stateful_widget(StatefulImage::default(), f.area(), &mut image);
-                    let mut bottom_line_area = f.area();
+
+                    let mut bottom_line_area = area;
                     bottom_line_area.y = bottom_line_area.height-1;
                     bottom_line_area.height=1;
 
