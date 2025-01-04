@@ -47,33 +47,14 @@ use atomicbox::AtomicOptionBox;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Normal,
-    Insert,
-    Replace(bool), // Bool for "once only?"
-    Visual,
     Command, // "colon mode", what the manual calls Command-line mode
-    Operator(char),
+    Operator(char)
 }
 
 impl Mode {
-    fn block<'a>(&self) -> Block<'a> {
-        let help = match self {
-            Self::Normal => "type :q to quit, type i to enter insert mode",
-            Self::Replace(_) | Self::Insert => "type Esc to back to normal mode",
-            Self::Visual => "type y to yank, type d to delete, type Esc to back to normal mode",
-            Self::Operator(_) => "move cursor to apply operator",
-            Self::Command => "enter command at prompt, or Esc for normal mode",
-        };
-        let title = format!("{} MODE ({})", self, help);
-        Block::default().borders(Borders::ALL).title(title)
-    }
-
     fn cursor_style(&self) -> Style {
         let color = match self {
-            Self::Normal => Color::Reset,
-            Self::Insert => Color::LightBlue,
-            Self::Visual => Color::LightYellow,
-            Self::Replace(_) => Color::LightRed,
-            Self::Operator(_) => Color::LightGreen,
+            Self::Normal | Self::Operator(_) => Color::Reset,
             // FIXME: This matches behavior of vim, would it be better to underline or something?
             Self::Command => { return Style::default(); }
         };
@@ -84,11 +65,7 @@ impl Mode {
 impl fmt::Display for Mode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         match self {
-            Self::Normal => write!(f, "NORMAL"),
-            Self::Insert => write!(f, "INSERT"),
-            Self::Visual => write!(f, "VISUAL"),
-            Self::Replace(_) => write!(f, "REPLACE"),
-            Self::Operator(c) => write!(f, "OPERATOR({})", c),
+            Self::Normal | Self::Operator(_) => write!(f, "NORMAL"),
             Self::Command => write!(f, "COMMAND"),
         }
     }
@@ -104,27 +81,6 @@ enum Transition {
 }
 
 // For ami
-
-const PLAYBACK_STACK_LIMIT:usize = 4;
-
-#[derive(Debug, Clone)]
-struct SpanIndex {
-    score:usize,
-    note:usize
-}
-
-struct VimAudioPlaybackStatus {
-    playing:[Option<SpanIndex>;PLAYBACK_STACK_LIMIT],
-    time:u32
-}
-
-struct VimAudioSeed {
-    time: std::sync::Arc<AtomicU32>,
-    play: std::sync::Arc<AtomicBool>,
-}
-
-// Ranges the way TextArea thinks about them
-type TextRange = ((usize, usize), (usize, usize));
 
 // Ranges the way pom thinks about them
 // Code by NicEastVillage on Github https://github.com/J-F-Liu/pom/issues/43#issuecomment-723645227
@@ -150,287 +106,7 @@ impl<'a, O: 'a> WithSpan<'a, O> for pom::utf8::Parser<'a, O> {
 
 // End NicEastvillage code
 
-// Language
-
-// Number: Play this note
-// Parenthesis: Store a pattern, first letter is the label (must be uppercase letter)
-// Square bracket: Scope
-// Uppercase letter: Play stored pattern
-// +Number, -Number: Shift base note by semitones
-// ++Number, --Number: Shift base note by octaves (or multiply/divide for non-notes)
-// x: rest
-// r: reset
-// pNumber, p+Number, p++Number etc: Set pitch, do NOT play note
-// tNumber, t+Number, t++Number etc: Set tempo (rate, high)
-// dNumber, d+Number, d++Number etc: set duty/duration (against basis of 8)
-// a&b: One, then the other
-
-// TODOs/document: pv, dv; !; #, ##;
-// TODOs/consider: pr, dr; &&, &&&; !!; :;
-
-// In comments below: An //AT comment implies audio thread only, a //PT comment implies processing thread only
-// There are two forms of this AST, a "raw" form and a "clean" form, but they have the same type.
-
-#[derive(Debug, Clone)]
-enum Act {
-    Set(i32),
-    Increment(i32),
-    Double(i32),
-    Versus(i32)
-}
-
-#[derive(Debug, Clone)]
-enum Adjust {
-    Pitch(Act, bool), // PT // Argument 2 is for "hard/send", e.g., p+ vs p++
-    Tempo(Act),
-    Duty(Act),
-    Reset // FIXME: Consider partials?
-}
-
-// The "primary value" of a note. May or may not literally correspond to pitch.
-// I tried really hard to think of a name for this enum other than "pitch" and failed.
-#[derive(Debug, Clone)]
-enum Pitch {
-    Abs(i32), // AT (0 == rest); MUST be sanitized for 0-128 range by time reaches AT
-    Rel(i32), // PT
-    Rest      // PT
-}
-
-#[derive(Debug, Clone)]
-enum NotePayload {
-    Play(Pitch),
-    Call(u8), // Goto proc
-    Fork(Vec<NotePayload>), // NOT IMPLEMENTED
-}
-
-// The parser creates according to Byte standard, it is adjusted to Index in a second step
-#[derive(Debug, Clone)]
-enum NoteSpan {
-    Byte(ByteSpan),
-    Index(SpanIndex)
-}
-
-#[derive(Debug, Clone)]
-struct Note {
-    span: NoteSpan,
-    adjust: Vec<Adjust>, // No adjustments -> vec len 0
-    payload:NotePayload,        // "Note value", may not correpsond to pitch per se
-}
-
-#[derive(Default, Debug, Clone)]
-struct Song {
-    prefix: Vec<Adjust>, // TODO consider tinyvec
-    procs: [Vec<Note>; 26],
-    score: Vec<Note>
-}
-
-// - TODO: Do the "name" args serve a purpose? Do they create perf issues? Should they be commented out?
-// - TODO: use "pom::parser::list()"
-fn parse_language(input:String) -> Result<Song, pom::Error> { // FIXME: &String?
-    use pom::utf8::*;
-
-    // Whitespace types
-
-    const SPACES:&str = " \t\r\n";
-    const SPACES_HASH:&str = " \t\r\n#";
-    const INLINE_SPACES:&str = " \t";
-    const NEWLINE_SPACES:&str = "\r\n";
-
-    // TODO: Thread in multiline pervasively so we can have t ++ 3
-    fn opt_space<'a>() -> Parser<'a, ()> {
-        one_of(SPACES).repeat(0..).discard()
-            .name("opt_space")
-    }
-
-    fn hash_word<'a>() -> Parser<'a, ()> {
-        sym('#').discard() * one_of(INLINE_SPACES).repeat(0..).discard()
-        * none_of(SPACES_HASH).repeat(1..).discard()
-    }
-
-    fn hash_line<'a>() -> Parser<'a, ()> {
-        seq("##").discard() * none_of(NEWLINE_SPACES).repeat(0..).discard()
-    }
-
-    fn one_blank<'a>(multiline:bool) -> Parser<'a, ()> {
-        one_of(if multiline {SPACES} else {INLINE_SPACES}).discard() | hash_word() | hash_line()
-    }
-
-    fn inline_opt_blank<'a>() -> Parser<'a, ()> {
-        one_blank(false).repeat(0..).discard()
-    }
-
-    fn inline_blank<'a>() -> Parser<'a, ()> {
-        one_blank(false).repeat(1..).discard()
-    }
-
-    fn opt_blank<'a>() -> Parser<'a, ()> {
-        one_blank(true).repeat(0..).discard()
-    }
-
-    fn blank<'a>() -> Parser<'a, ()> {
-        one_blank(true).repeat(1..).discard()
-    }
-
-    // Primitive tokens
-
-    fn positive<'a>() -> Parser<'a, i32> {
-        let integer = (one_of("123456789").discard() * one_of("0123456789").discard().repeat(0..)).discard()
-            | sym('0').discard();
-//      sym('-').discard().opt() * // TODO: negative numbers via quotes
-//      let integer = digit.discard().repeat(1..);
-        integer.collect().convert(|x| x.parse::<i32>())
-            .name("positive")
-    }
-
-    fn proc_name<'a>() -> Parser<'a, u8> {
-        one_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ").map(|ch| (ch as u32 - 'A' as u32) as u8)
-    }
-
-    // Compound tokens
-
-    fn act<'a>(set:bool) -> Parser<'a, Act> {
-        {
-            let mut p = (sym('v') * positive()).map(|x| Act::Versus(x))
-            | (seq("++") * positive()).map(|x| Act::Double(x))
-            | (seq("--") * positive()).map(|x| Act::Double(-x))
-            | (sym('+') * positive()).map(|x| Act::Increment(x))
-            | (sym('-') * positive()).map(|x| Act::Increment(-x));
-            if set {
-                p = p | positive().map(|x| Act::Set(x))
-            }
-            p
-        }.name("act")
-    }
-
-    fn adjust<'a>() -> Parser<'a, Adjust> {
-        (
-            sym('r').map(|_|Adjust::Reset)
-            | (sym('d') * act(true)).map(|act|Adjust::Duty(act))
-            | (sym('t') * act(true)).map(|act|Adjust::Tempo(act))
-            | (sym('p') * positive()).map(|x|Adjust::Pitch(Act::Set(x), true))
-            | (sym('p').opt() + act(false)).map(|(hard, act)|Adjust::Pitch(act, hard.is_some()))
-        ).name("adjust")
-    }
-
-    fn note_pitch<'a>() -> Parser<'a, Pitch> {
-        (
-            sym('x').map(|_|Pitch::Rest) | positive().map(Pitch::Rel)
-        ).name("pitch")
-    }
-
-    // Utility
-    fn require_one<T>(v:Vec<T>) -> pom::Result<Vec<T>> { // TODO: Collapse with map below? Only used once
-        if v.len() > 0 {
-            Ok(v)
-        } else {
-            Err(pom::Error::Incomplete)
-        }
-    }
-
-    fn note_payload<'a>() -> Parser<'a, NotePayload> {
-        (
-            list(
-                note_pitch().map(NotePayload::Play)
-                | proc_name().map(NotePayload::Call),
-                opt_blank() * sym('&') * opt_blank()
-            ).convert(require_one).map(|v|
-                if v.len() > 1 {
-                    NotePayload::Fork(v)
-                } else {
-                    v.into_iter().next().unwrap() // Destroy vector and extract single element
-                }
-            )
-        ).name("node")
-    }
-
-    fn note<'a>() -> Parser<'a, Note> { // TODO: Collapse Option<Vec<Adjust>> into Vec<Adjust> and use 0..?
-        (
-            (adjust() - blank()).repeat(0..) + note_payload()
-        ).name("note").with_span().map(|(span, (adjust, payload))| Note {span:NoteSpan::Byte(span), adjust, payload})
-    }
-
-    // Utility
-    // TODO: Learn to fail
-    fn sort_procs(vv: Vec<(u8, Vec<Note>)>) -> [Vec<Note>; 26] {
-        let mut procs: [Vec<Note>; 26] = Default::default();
-        for (name, v) in vv {
-//            if procs[name as usize].size() > 0 { return Err() }
-            procs[name as usize] = v;
-        }
-        procs
-    }
-
-    fn node_list<'a>() -> Parser<'a, Vec<Note>> {
-        opt_blank() * list(note(), blank())
-    }
-
-    // TODO: parser should produce a song
-    let parser =
-        // Init adjustments
-        (
-            opt_space() * sym('!') * (
-                (
-                    inline_opt_blank() *
-                    list(adjust(), inline_blank())
-                )
-                | inline_opt_blank().map(|_|vec![])
-            ) - sym('\n')
-        ).repeat(0..).map(|v|v.into_iter().flatten().collect()) +
-        (
-            opt_space() * sym('(') * ( proc_name() + node_list() )
-            - sym(')')
-        ).repeat(0..).map(sort_procs) +
-        (
-            (node_list() - opt_blank())
-            | opt_blank().map(|_|vec![]) // Empty file is valid
-        )
-        - end()
-    ;
-    parser.map(|((prefix, procs), score)|Song {prefix, procs, score}).parse_str(&input)
-}
-
-// Translate PT to AT
-// Note: Consumes song
-fn respan_language(s:Song, lines:&[String], song_highlights:&mut Vec<TextRange>) -> Song {
-    let mut line_at = 0;
-    let mut char_at = 0;
-    let mut chars:Option<std::str::Chars> = None;
-    song_highlights.clear();
-    // TODO adapt from line 1861
-
-    use std::collections::HashMap; // Overkill but who cares
-    let mut letter_index: HashMap<u8, usize> = Default::default();
-    letter_index.reserve(26);
-    fn recurse(n: Note, letter_index: HashMap<u8, usize>) {
-
-    }
-    let prefix = s.prefix;
-    let procs = {
-        let mut count = 0;
-        s.procs.map(|v| {
-            let letter_count = letter_index.len();
-            let v = if v.len() > 0 {
-                letter_index.insert(count as u8, letter_count);
-                v.into_iter().map(|n| n).collect()
-            } else {
-                v
-            };
-            count += 1;
-            v
-        })
-    };
-    let score = s.score.into_iter().collect();
-    Song {prefix, procs, score}
-}
-
-
 // Command line parser
-
-enum CommandLineTotality {
-    Auto,
-    All,
-    Buffer,
-}
 
 enum CommandLineSetType {
     On,
@@ -438,21 +114,14 @@ enum CommandLineSetType {
     Question
 }
 
-enum CommandLineFileOp {
-    Read(bool), // Force?
-    Write
-}
-
 // TODO: reset, reset!, set for tones, play
 enum CommandLine {
-    New(bool), // Exclamation
-    File(CommandLineFileOp, bool, String), // write?, "in-buffer"?, name
-    Wqae(bool, bool, CommandLineTotality, bool), // Write, Quit, All/Buffer, Exclamation
+    New,
+    Quit,
     Help(String),
     Set(String, CommandLineSetType), // What you set, what you set it to // TODO: Local?
-    Beep
-//    Play(Option<u32>)
-//    Split(Option<String>), // Filename
+    Beep,
+    Taunt(bool),
 }
 
 // TODO: ignore surrounding whitespace
@@ -472,33 +141,10 @@ fn parse_command_line(input:String) -> Result<CommandLine, pom::Error> { // FIXM
     }
 
     // wqa! . Gets its own breakout cuz it's complicated
-    let wqae = (
-            ( // one of w or q must be present
-                seq("q").map(|_|(false, true)) // q by itself
-                | (                            // w or wq
-                    seq("w").map(|_|(true)) +
-                    seq("q").opt().map(|x|x.is_some())
-                  )
-            ) + ( // a/all, or b/buffer?
-                (seq("a") * seq("ll").opt() ).map(|_|CommandLineTotality::All)
-                | (seq("b") * seq("uffer").opt() ).map(|_|CommandLineTotality::Buffer)
-            ).opt().map(|x|x.unwrap_or(CommandLineTotality::Auto))
-            + seq("!").opt().map(|x|x.is_some()) // Force?
-        ).map(|(((a,b),c),d)| CommandLine::Wqae(a,b,c,d));
+    let wqae = (seq("q").discard() - seq("uit").discard().opt()).map(|_| CommandLine::Quit);
 
-    let parser = (
-          (seq("new").discard() * sym('!').discard().opt()).map(|force| CommandLine::New(force.is_some()))
-
-        | ((seq("write").discard() | sym('w').discard())
-            * (sym('v').discard() | seq("visual").discard()).opt()
-            + space() * unspace().collect()).map(|(visual, x)| CommandLine::File(CommandLineFileOp::Write, visual.is_some(), x.to_string()))
-
-        | ((seq("edit").discard() | sym('e').discard())
-            * sym('!').discard().opt()
-            + space() * unspace().collect()).map(|(force, x)| CommandLine::File(CommandLineFileOp::Read(force.is_some()), false, x.to_string()))
-
-        | ((sym('!').discard() * opt_space()).opt() * (seq("cat"))
-            * space() * unspace().collect()).map(|x| CommandLine::File(CommandLineFileOp::Read(false), true, x.to_string()))
+    let parser =
+          seq("new").discard().map(|_| CommandLine::New)
 
         | wqae
 
@@ -513,7 +159,9 @@ fn parse_command_line(input:String) -> Result<CommandLine, pom::Error> { // FIXM
                 ))
             ).map(|(s,t)|CommandLine::Set(s.to_string(), t))
 
-        | (seq("beep").map(|_| CommandLine::Beep))
+        | seq("beep").discard().map(|_| CommandLine::Beep)
+
+        | (seq("taunt").discard() * sym('!').discard().opt()).map(|e| CommandLine::Taunt(e.is_some())
     ) - end();
     parser.parse_str(&input)
 }
@@ -522,73 +170,25 @@ fn parse_command_line(input:String) -> Result<CommandLine, pom::Error> { // FIXM
 struct Vim {
     mode: Mode,
     pending: Input, // Pending input to handle a sequence with two keys like gg
-    current_file: Option<PathBuf>,
-    audio_dirty: bool, // Changed since last audio send
-    save_dirty: bool,  // Changed since last save
-    audio:VimAudioSeed
+}
+
+enum OrbEffect {
+    None,
+    Reset
 }
 
 // All changes in a single Vim transition
 struct VimChanges {
     transition:Transition,
-    dirty: bool,      // If newly dirty
-    save_reset: bool, // CLEARS save_dirty
-    file_reset: bool, // :new, empty all text
-    current_file: Option<PathBuf>, // If it changed
+    effect:OrbEffect,
     status_message: Option<String> // If it changed
 }
 
 impl Vim {
-    fn new(mode: Mode, current_file:Option<PathBuf>, audio_dirty:bool, save_dirty:bool, audio:VimAudioSeed) -> Self {
+    fn new(mode: Mode) -> Self {
         Self {
             mode,
-            pending: Input::default(),
-            current_file,
-            audio_dirty,
-            save_dirty,
-            audio
-        }
-    }
-
-    // Dump the contents of a file to a vector.
-    // TODO merge with load<>?
-    fn load_raw<'a>(&self, file: &PathBuf) -> io::Result<Vec<String>> {
-        let file = fs::File::open(file)?;
-        io::BufReader::new(file)
-            .lines()
-            .collect::<io::Result<_>>()
-    }
-
-    // Create a textarea containing the contents of a file.
-    // If no name is provided, the current file will be loaded.
-    fn load<'a>(&self, current_file: Option<&PathBuf>) -> io::Result<TextArea<'a>> {
-        let current_file = current_file.or(self.current_file.as_ref());
-        if let Some(path) = current_file {
-            let file = fs::File::open(path)?;
-            io::BufReader::new(file)
-                .lines()
-                .collect::<io::Result<_>>()
-        } else {
-            Ok(TextArea::default())
-        }
-    }
-
-    // Write out some lines to a file.
-    // If no name is provided, the current file will be written.
-    // FIXME: This is not atomic. Do the write-and-rename trick.
-    fn save<'a>(&self, current_file: Option<&PathBuf>, lines:&[String]) -> io::Result<()> {
-        let current_file = current_file.or(self.current_file.as_ref());
-        if let Some(path) = current_file {
-            let mut file = fs::File::create(path)?;
-
-            for line in lines {
-                file.write(line.as_bytes())?;
-                file.write("\n".as_bytes())?; // Of course it's ok to always add a newline… this is vi
-            }
-
-            Ok(())
-        } else {
-            Err(io::Error::new(io::ErrorKind::InvalidInput, "No file name")) // FIXME: If it ever becomes stable change to InvalidFilename
+            pending: Input::default()
         }
     }
 
@@ -600,27 +200,13 @@ impl Vim {
         Self {
             mode: self.mode,
             pending,
-            current_file: self.current_file,
-            audio_dirty: self.audio_dirty,
-            save_dirty: self.save_dirty,
-            audio: self.audio
         }
     }
 
-    // True if the textarea cursor is at the end of its given line
-    fn is_before_line_end(textarea: &TextArea<'_>) -> bool {
-        let (cursor_line, cursor_char) = textarea.cursor();
-        let lines = textarea.lines();
-        let line = &lines[cursor_line];
-        let line_length = line.chars().count(); // FIXME: Not acceptable-- O(N)
-
-        cursor_char < line_length
-    }
-
     // Result: This function should not modify vim, only provide a set of changes to apply to vim
-    fn transition(&self, input: Input, textarea: &mut TextArea<'_>, command: &mut TextArea<'_>) -> VimChanges {
+    fn transition(&self, input: Input, command: &mut TextArea<'_>) -> VimChanges {
         const NOP:VimChanges = VimChanges {
-            transition:Transition::Nop, dirty:false, save_reset:false, file_reset:false, current_file:None, status_message:None
+            transition:Transition::Nop, effect:OrbEffect::None, status_message:None
         };
 
         if input.key == Key::Null {
@@ -628,395 +214,8 @@ impl Vim {
         }
 
         match self.mode {
-            Mode::Normal | Mode::Visual | Mode::Operator(_) => {
+            Mode::Normal | Mode::Operator(_) => {
                 match input {
-                    Input {
-                        key: Key::Char('h'),
-                        ..
-                    } |
-                    Input {
-                        key: Key::Left,
-                        ..
-                    } => textarea.move_cursor(CursorMove::Back),
-
-                    Input {
-                        key: Key::Char('j'),
-                        ..
-                    } |
-                    Input {
-                        key: Key::Down,
-                        ..
-                    } => textarea.move_cursor(CursorMove::Down),
-
-                    Input {
-                        key: Key::Char('k'),
-                        ..
-                    } |
-                    Input {
-                        key: Key::Up,
-                        ..
-                    } => textarea.move_cursor(CursorMove::Up),
-
-                    Input {
-                        key: Key::Char('l'),
-                        ..
-                    } |
-                    Input {
-                        key: Key::Right,
-                        ..
-                    } => textarea.move_cursor(CursorMove::Forward),
-
-                    Input {
-                        key: Key::Char('w'),
-                        ..
-                    } => textarea.move_cursor(CursorMove::WordForward),
-                    Input {
-                        key: Key::Char('e'),
-                        ctrl: false,
-                        ..
-                    } => {
-                        textarea.move_cursor(CursorMove::WordEnd);
-                        if matches!(self.mode, Mode::Operator(_)) {
-                            textarea.move_cursor(CursorMove::Forward); // Include the text under the cursor
-                        }
-                    }
-                    Input {
-                        key: Key::Char('b'),
-                        ctrl: false,
-                        ..
-                    } => textarea.move_cursor(CursorMove::WordBack),
-                    Input {
-                        key: Key::Char('^'),
-                        ..
-                    } => textarea.move_cursor(CursorMove::Head),
-                    Input {
-                        key: Key::Char('$'),
-                        ..
-                    } => textarea.move_cursor(CursorMove::End),
-                    Input { // Note: Not sorted with j
-                        key: Key::Char('J'),
-                        ..
-                    } => {
-                        let mut cursor = textarea.cursor();
-                        let mut line_count = 1;
-                        let mut dirty = false;
-
-                        if let Some(((from_line, from_idx), (to_line, _))) = textarea.selection_range() {
-                            // J with a selection joins all lines selected
-                            // If only one line is selected, it acts like normal J,
-                            // except on failure the cursor moves to selection start.
-                            line_count = (to_line-from_line).max(1);
-                            cursor = (from_line, from_idx);
-                            textarea.cancel_selection(); // fixme restore
-                            textarea.move_cursor(CursorMove::Jump(from_line as u16, from_idx as u16));
-                        }
-
-                        for _ in 0..line_count {
-                            textarea.move_cursor(CursorMove::End);
-                            let success = textarea.delete_line_by_end();
-                            if success { // A line existed
-                                textarea.insert_char(' ');
-                                dirty = true;
-                            } else { // In regular vim, joining on the final line is a noop
-                                let (c1, c2) = cursor;
-                                textarea.move_cursor(CursorMove::Jump(c1 as u16, c2 as u16));
-                                self.beep();
-                            }
-                        }
-                        return VimChanges { dirty, ..NOP };
-                    }
-                    Input {
-                        key: Key::Char('D'),
-                        ..
-                    } => {
-                        textarea.delete_line_by_end();
-                        return VimChanges { transition:Transition::Mode(Mode::Normal), dirty:true, ..NOP };
-                    }
-                    Input {
-                        key: Key::Char('C'),
-                        ..
-                    } => {
-                        textarea.delete_line_by_end();
-                        textarea.cancel_selection();
-                        return VimChanges { transition:Transition::Mode(Mode::Insert), dirty:true, ..NOP };
-                    }
-                    Input {
-                        key: Key::Char('p'),
-                        ..
-                    } => {
-                        textarea.paste();
-                        return VimChanges { transition:Transition::Mode(Mode::Normal), dirty:true, ..NOP };
-                    }
-                    Input {
-                        key: Key::Char('u'),
-                        ctrl: false,
-                        ..
-                    } => {
-                        textarea.undo();
-                        return VimChanges { transition:Transition::Mode(Mode::Normal), dirty:true, ..NOP };
-                    }
-                    Input {
-                        key: Key::Char('r'),
-                        ctrl: true,
-                        ..
-                    } => {
-                        textarea.redo();
-                        return VimChanges { transition:Transition::Mode(Mode::Normal), dirty:true, ..NOP };
-                    }
-                    Input {
-                        key: Key::Char('x'),
-                        ..
-                    } => {
-                        // FIXME: This check shouldn't be necessary, but the vim example is able to cursor over a terminating newline currently, which real vim can't in normal mode
-                        // FIXME: Repeatedly mashing x at the end of a line should delete the entire line right to left
-                        if Vim::is_before_line_end(&textarea) {
-                            textarea.delete_next_char();
-                        }
-                        return VimChanges { transition:Transition::Mode(Mode::Normal), dirty:true, ..NOP };
-                    }
-                    Input {
-                        key: Key::Char('i'),
-                        ..
-                    } => {
-                        textarea.cancel_selection();
-                        return VimChanges { transition:Transition::Mode(Mode::Insert), ..NOP };
-                    }
-                    Input {
-                        key: Key::Char('a'),
-                        ..
-                    } => {
-                        textarea.cancel_selection();
-
-                        if Vim::is_before_line_end(&textarea) {
-                            textarea.move_cursor(CursorMove::Forward);
-                        }
-                        return VimChanges { transition:Transition::Mode(Mode::Insert), ..NOP };
-                    }
-                    Input {
-                        key: Key::Char('A'),
-                        ..
-                    } => {
-                        textarea.cancel_selection();
-                        textarea.move_cursor(CursorMove::End);
-                        return VimChanges { transition:Transition::Mode(Mode::Insert), ..NOP };
-                    }
-                    Input {
-                        key: Key::Char('S'),
-                        ..
-                    } => {
-                        let mut line_count = 1;
-
-                        if let Some(((from_line, from_idx), (to_line, _))) = textarea.selection_range() {
-                            // S with a selection clears all lines selected
-                            line_count = (to_line-from_line).max(1);
-
-                            textarea.cancel_selection(); // fixme restore
-                            textarea.move_cursor(CursorMove::Jump(from_line as u16, from_idx as u16));
-                        }
-
-                        textarea.move_cursor(CursorMove::Head);
-                        for line_idx in 0..line_count {
-                            let (cursor_line, _) = textarea.cursor();
-                            let lines = textarea.lines();
-                            let line = &lines[cursor_line];
-
-                            if line.len() > 0 {
-                                // delete_line_by_end has a special behavior where if you are at the end,
-                                // it joins the line with the next. Prevent accidentally triggering this on an empty line.
-                                textarea.delete_line_by_end();
-                            }
-
-                            if line_idx < line_count-1 {
-                                // We are now guaranteed at the end of the line.
-                                // Join to next line.
-                                textarea.delete_line_by_end();
-                            }
-                        }
-
-                        return VimChanges { transition:Transition::Mode(Mode::Insert), dirty:true, ..NOP };
-                    }
-                    Input {
-                        key: Key::Char('o'),
-                        ..
-                    } => {
-                        textarea.move_cursor(CursorMove::End);
-                        textarea.insert_newline();
-                        return VimChanges { transition:Transition::Mode(Mode::Insert), dirty:true, ..NOP };
-                    }
-                    Input {
-                        key: Key::Char('O'),
-                        ..
-                    } => {
-                        textarea.move_cursor(CursorMove::Head);
-                        textarea.insert_newline();
-                        textarea.move_cursor(CursorMove::Up);
-                        return VimChanges { transition:Transition::Mode(Mode::Insert), dirty:true, ..NOP };
-                    }
-                    Input {
-                        key: Key::Char('I'),
-                        ..
-                    } => {
-                        textarea.cancel_selection();
-                        textarea.move_cursor(CursorMove::Head);
-                        return VimChanges { transition:Transition::Mode(Mode::Insert), ..NOP };
-                    }
-                    Input {
-                        key: Key::Char('r'),
-                        ..
-                    } => {
-                        // Notice selection is not cancelled-- it will be used by replace mode
-                        return VimChanges { transition:Transition::Mode(Mode::Replace(true)), ..NOP };
-                    }
-                    Input {
-                        key: Key::Char('R'),
-                        ..
-                    } => {
-                        if textarea.selection_range().is_some() {
-                            // R with a selection does the same thing as S-- it enters Insert NOT Replace mode.
-                            return self.transition(Input { key: Key::Char('S'), ctrl: false, alt: false, shift: true }, textarea, command);
-                        } else {
-                            return VimChanges { transition:Transition::Mode(Mode::Replace(false)), ..NOP };
-                        }
-                    }
-
-                    /*
-                    // You're not getting out so easily
-                    Input {
-                        key: Key::Char('q'),
-                        ..
-                    } => return Transition::Quit,
-                    */
-                    Input {
-                        key: Key::Char('e'),
-                        ctrl: true,
-                        ..
-                    } => textarea.scroll((1, 0)),
-                    Input {
-                        key: Key::Char('y'),
-                        ctrl: true,
-                        ..
-                    } => textarea.scroll((-1, 0)),
-                    Input {
-                        key: Key::Char('d'),
-                        ctrl: true,
-                        ..
-                    } => textarea.scroll(Scrolling::HalfPageDown),
-                    Input {
-                        key: Key::Char('u'),
-                        ctrl: true,
-                        ..
-                    } => textarea.scroll(Scrolling::HalfPageUp),
-                    Input {
-                        key: Key::Char('f'),
-                        ctrl: true,
-                        ..
-                    } => textarea.scroll(Scrolling::PageDown), // FIXME but don't scroll below end
-                    Input {
-                        key: Key::Char('b'),
-                        ctrl: true,
-                        ..
-                    } => textarea.scroll(Scrolling::PageUp),
-                    Input {
-                        key: Key::Char('v'),
-                        ctrl: false,
-                        ..
-                    } if self.mode == Mode::Normal => {
-                        textarea.start_selection();
-                        return VimChanges { transition:Transition::Mode(Mode::Visual), ..NOP };
-                    }
-                    Input {
-                        key: Key::Char('V'),
-                        ctrl: false,
-                        ..
-                    } if self.mode == Mode::Normal => {
-                        textarea.move_cursor(CursorMove::Head);
-                        textarea.start_selection();
-                        textarea.move_cursor(CursorMove::End);
-                        return VimChanges { transition:Transition::Mode(Mode::Visual), ..NOP };
-                    }
-                    Input { key: Key::Esc, .. }
-                    | Input {
-                        key: Key::Char('['),
-                        ctrl: true,
-                        ..
-                    }
-                    | Input {
-                        key: Key::Char('v'),
-                        ctrl: false,
-                        ..
-                    } if self.mode == Mode::Visual => {
-                        textarea.cancel_selection();
-                        return VimChanges { transition:Transition::Mode(Mode::Normal), ..NOP };
-                    }
-                    Input {
-                        key: Key::Char('g'),
-                        ctrl: false,
-                        ..
-                    } if matches!(
-                        self.pending,
-                        Input {
-                            key: Key::Char('g'),
-                            ctrl: false,
-                            ..
-                        }
-                    ) =>
-                    {
-                        textarea.move_cursor(CursorMove::Top)
-                    }
-                    Input {
-                        key: Key::Char('G'),
-                        ctrl: false,
-                        ..
-                    } => textarea.move_cursor(CursorMove::Bottom),
-                    Input {
-                        key: Key::Char(c),
-                        ctrl: false,
-                        ..
-                    } if self.mode == Mode::Operator(c) => {
-                        // Handle yy, dd, cc. (This is not strictly the same behavior as Vim)
-                        textarea.move_cursor(CursorMove::Head);
-                        textarea.start_selection();
-                        let cursor = textarea.cursor();
-                        textarea.move_cursor(CursorMove::Down);
-                        if cursor == textarea.cursor() {
-                            textarea.move_cursor(CursorMove::End); // At the last line, move to end of the line instead
-                        }
-                    }
-                    Input {
-                        key: Key::Char(op @ ('y' | 'd' | 'c')),
-                        ctrl: false,
-                        ..
-                    } if self.mode == Mode::Normal => {
-                        textarea.start_selection();
-                        return VimChanges { transition:Transition::Mode(Mode::Operator(op)), ..NOP };
-                    }
-                    Input {
-                        key: Key::Char('y'),
-                        ctrl: false,
-                        ..
-                    } if self.mode == Mode::Visual => {
-                        textarea.move_cursor(CursorMove::Forward); // Vim's text selection is inclusive
-                        textarea.copy();
-                        return VimChanges { transition:Transition::Mode(Mode::Normal), ..NOP };
-                    }
-                    Input {
-                        key: Key::Char('d'),
-                        ctrl: false,
-                        ..
-                    } if self.mode == Mode::Visual => {
-                        textarea.move_cursor(CursorMove::Forward); // Vim's text selection is inclusive
-                        textarea.cut();
-                        return VimChanges { transition:Transition::Mode(Mode::Normal), dirty:true, ..NOP };
-                    }
-                    Input {
-                        key: Key::Char('c'),
-                        ctrl: false,
-                        ..
-                    } if self.mode == Mode::Visual => {
-                        textarea.move_cursor(CursorMove::Forward); // Vim's text selection is inclusive
-                        textarea.cut();
-                        return VimChanges { transition:Transition::Mode(Mode::Insert), dirty:true, ..NOP };
-                    }
                     Input {
                         key: Key::Char(':'),
                         ..
@@ -1034,104 +233,9 @@ impl Vim {
 
                 // Handle the pending operator
                 match self.mode {
-                    Mode::Operator('y') => {
-                        textarea.copy();
-                        VimChanges { transition:Transition::Mode(Mode::Normal), ..NOP }
-                    }
-                    Mode::Operator('d') => {
-                        textarea.cut();
-                        VimChanges { transition:Transition::Mode(Mode::Normal), dirty:true, ..NOP }
-                    }
-                    Mode::Operator('c') => {
-                        textarea.cut();
-                        VimChanges { transition:Transition::Mode(Mode::Insert), dirty:true, ..NOP }
-                    }
                     _ => VimChanges { ..NOP },
                 }
             }
-            Mode::Insert => match input {
-                Input { key: Key::Esc, .. }
-                | Input {
-                    key: Key::Char('['),
-                    ctrl: true,
-                    ..
-                }
-                | Input {
-                    key: Key::Char('c'),
-                    ctrl: true,
-                    ..
-                } => VimChanges { transition:Transition::Mode(Mode::Normal), ..NOP },
-                input => {
-                    textarea.input(input); // Use default key mappings in insert mode
-                    VimChanges { transition:Transition::Mode(Mode::Insert), dirty:true, ..NOP }
-                }
-            },
-            Mode::Replace(once) => match input {
-                Input { key: Key::Esc, .. }
-                | Input {
-                    key: Key::Char('['),
-                    ctrl: true,
-                    ..
-                }
-                | Input {
-                    key: Key::Char('c'),
-                    ctrl: true,
-                    ..
-                } => {
-                    VimChanges { transition: if textarea.selection_range().is_some() {
-                        // The user made a selection, hit lowercase 'r', then aborted.
-                        // (It shouldn't be possible to get here in non-"once" mode.)
-                        Transition::Mode(Mode::Visual)
-                    } else {
-                        Transition::Mode(Mode::Normal)
-                    }, ..NOP }
-                },
-                Input { key, .. }  => {
-                    let dirty =
-                        if match key { Key::Down | Key::Up | Key::Left | Key::Right => false, _ => true }
-                        && !(once && (key == Key::Backspace || key == Key::Delete)) { // Allowed with R, not r
-                            if let Some(((from_line, from_idx), (to_line, to_idx))) = textarea.selection_range() {
-                                // Bizarro 'r' with a selection: Replace every non-newline character at once?!
-                                let mut next_start_idx = from_idx;
-                                for line_idx in from_line..=to_line {
-                                    let lines = textarea.lines();
-                                    let line = &lines[line_idx];
-                                    let line_len = line.len();
-
-                                    textarea.move_cursor(CursorMove::Jump(line_idx as u16, next_start_idx as u16));
-
-                                    // "min" is to handle the odd case where the cursor is on the newline (not possible in real vim)
-                                    let end_idx = if line_idx==to_line { line_len.min(to_idx+1) }
-                                    else { line_len };
-
-                                    for _ in next_start_idx..end_idx {
-                                        textarea.delete_next_char();
-                                        textarea.input(input.clone());
-                                    }
-
-                                    next_start_idx = 0;
-                                }
-
-                                textarea.move_cursor(CursorMove::Jump(from_line as u16, from_idx as u16));
-                            } else {
-                                // Normal 'r'
-                                if Vim::is_before_line_end(&textarea) {
-                                    textarea.delete_next_char(); // FIXME: Will eat newlines and join into next line, should act like insert at end of line
-                                }
-                                textarea.input(input); // Use default key mappings in insert mode
-                            }
-                            true
-                        } else {
-                            self.beep();
-                            false
-                        };
-                    VimChanges { transition: if once {
-                        Transition::Mode(Mode::Normal)
-                    } else {
-                        Transition::Mode(Mode::Replace(false))
-                    }, dirty, ..NOP }
-                }
-            },
             Mode::Command => match input {
                 // Exit command mode abnormally
                 Input { key: Key::Esc, .. }
@@ -1155,147 +259,23 @@ impl Vim {
                     let mut error:Option<String> = None;
                     const NO_WRITE:&str = "Error: No write since last change (add ! to override)";
 
-                    match entry { // Notice: Currently ! not supported
-                        Ok(CommandLine::Wqae(w, q, _totality, force)) => {
-                            if w {
-                                match self.save(None, textarea.lines()) {
-                                    Ok(()) => {
-                                        return VimChanges { transition: if q {Transition::Quit} else {Transition::Mode(Mode::Normal)}, ..NOP }
-                                    }
-                                    Err(e) => {
-                                        error = Some(format!("Error: Cannot w{}: {e}", if q { "+q" } else { "rite" }));
-                                        self.beep();
-                                    }
-                                }
-                            } else if q {
-                                if self.save_dirty && !force {
-                                    error = Some(NO_WRITE.to_string());
-                                    self.beep();
-                                } else {
-                                    return VimChanges { transition:Transition::Quit, ..NOP }; // Short circuit
-                                }
-                            }
+                    match entry {
+                        Ok(CommandLine::Quit) => {
+                            return VimChanges { transition:Transition::Quit, ..NOP }; // Short circuit
                         },
-                        Ok(CommandLine::New(force)) =>
-                            if self.save_dirty && !force {
-                                error = Some(NO_WRITE.to_string());
-                                self.beep();
-                            } else {
-                                return VimChanges { transition:Transition::Mode(Mode::Normal), dirty:true, save_reset:true, file_reset:true, ..NOP }
-                            }
-                        Ok(CommandLine::File(op, inline, path)) => {
-                            let path = Path::new(&path).to_path_buf();
-
-                            match (op, inline) {
-                                // Simple file operations
-                                (CommandLineFileOp::Read(force), false) => {
-                                    if self.save_dirty && !force {
-                                        error = Some(NO_WRITE.to_string());
-                                    } else {
-                                        match self.load(Some(&path)) {
-                                            Ok(new_textarea) => {
-                                                *textarea = new_textarea;
-                                                return VimChanges { transition:Transition::Mode(Mode::Normal), dirty:true, save_reset:true, current_file:Some(path), ..NOP }
-                                            },
-                                            Err(e) => {
-                                                error = Some(format!("Error: Cannot read: {e}"));
-                                                self.beep();
-                                            }
-                                        }
-                                    }
-                                },
-                                (CommandLineFileOp::Write, false) =>
-                                    match self.save(Some(&path), textarea.lines()) {
-                                        Ok(()) => {
-                                            return VimChanges { transition:Transition::Mode(Mode::Normal), save_reset:true, current_file:Some(path), ..NOP }
-                                        },
-                                        Err(e) => {
-                                            error = Some(format!("Error: Cannot write: {e}"));
-                                            self.beep();
-                                        }
-                                    },
-
-                                // Special "in-buffer" file operations--
-                                // activated with :cat and :wv these paste a file *into* a buffer,
-                                // or read selected text out of a buffer, rather than whole files.
-                                (CommandLineFileOp::Read(_), true) => {
-                                    match self.load_raw(&path) {
-                                        Ok(file_lines) => {
-                                            let old_yank = textarea.yank_text();
-
-                                            if textarea.selection_range().is_some() {
-                                                textarea.move_cursor(CursorMove::Forward); // Vim's text selection is inclusive
-                                                textarea.cut();
-                                            }
-                                            let (cursor_line, cursor_char) = textarea.cursor();
-
-                                            textarea.set_yank_text(file_lines.join("\n"));
-                                            textarea.paste();
-                                            textarea.set_yank_text(old_yank);
-
-                                            textarea.move_cursor(CursorMove::Jump(cursor_line as u16, cursor_char as u16));
-                                        },
-                                        Err(e) => {
-                                            error = Some(format!("Error: Cannot read: {e}"));
-                                            self.beep();
-                                        }
-                                    }
-                                },
-                                (CommandLineFileOp::Write, true) => {
-                                    if let Some(((from_line, from_idx), (to_line, to_idx))) = textarea.selection_range() {
-                                        // Kludge: For most range ops we move forward the cursor for inclusion, but here we just made the operations inclusive
-
-                                        // Note, INCLUSIVE // How is this not in a crate somewhere already??
-                                        fn char_range(s: &String, from:usize, to:usize) -> String
-                                        {
-                                            s.chars().skip(from).take(to - from + 1).collect::<String>()
-                                        }
-                                        fn char_range_open(s: &String, from:usize) -> String
-                                        {
-                                            s.chars().skip(from).collect::<String>()
-                                        }
-                                        fn char_range_closed(s: &String, to:usize) -> String
-                                        {
-                                            s.chars().take(to+1).collect::<String>()
-                                        }
-
-                                        let in_lines = textarea.lines();
-                                        let mut out_lines: Vec<String> = Default::default();
-                                        if from_line == to_line {
-                                            out_lines.push(char_range(&in_lines[from_line], from_idx, to_idx))
-                                        } else { // TODO split to line-operations.rs?
-                                            for line_idx in from_line..=to_line {
-                                                let in_line = &in_lines[line_idx];
-                                                if line_idx == from_line {
-                                                    out_lines.push(char_range_open(in_line, from_idx));
-                                                } else if line_idx == to_line {
-                                                    out_lines.push(char_range_closed(in_line, to_idx).to_string());
-                                                } else {
-                                                    out_lines.push(in_line.clone());
-                                                }
-                                            }
-                                        }
-                                        match self.save(Some(&path), &out_lines) {
-                                            Ok(()) => {
-                                                // Not sure I like this behavior, but it's what vi does? --mcc
-                                                textarea.cancel_selection();
-                                                textarea.move_cursor(CursorMove::Jump(from_line as u16, from_idx as u16));
-                                            },
-                                            Err(e) => {
-                                                error = Some(format!("Error: Cannot write: {e}"));
-                                                self.beep();
-                                            }
-                                        }
-                                    } else {
-                                        error = Some(format!("Error: No text selected (:writev)."));
-                                        self.beep();
-                                    }
-                                },
-                            }
-                        },
+                        Ok(CommandLine::New) =>
+                            return VimChanges { transition:Transition::Mode(Mode::Normal), effect:OrbEffect::Reset, ..NOP },
                         Ok(CommandLine::Beep) => {
                             self.beep();
                         },
+                        Ok(CommandLine::Taunt(e)) => {
+                            if !e {
+                                error = Some("The Orb remains implacable".to_string());
+                            } else {
+                                self.beep();
+                                error = Some("Despite your efforts, the Orb remains implacable".to_string());
+                            }
+                        }
                         //Err(e) => { eprintln!("ERR {}", e); },
                         _ => { // : syntax error // TODO: print error if any?
                             error = Some(format!("Not a command: {}", command.lines()[0].clone()));
@@ -1315,419 +295,29 @@ impl Vim {
     }
 }
 
-struct AudioSeed {
-    time: std::sync::Arc<AtomicU32>,
-    play: std::sync::Arc<AtomicBool>,
-    song: std::sync::Arc<AtomicOptionBox<Song>>
-}
-
-fn audio_write<T>(output: &mut [T], channels: usize, next_sample: &mut dyn FnMut() -> f32, audio_log: &mut AudioLog)
-where
-    T: Sample + FromSample<f32> + bytemuck::Pod, /* Pod constraint can be removed without audio_log */
-{
-    // Chop output array into slices of size "channels"
-    for frame in output.chunks_mut(channels) {
-        let value: T = T::from_sample(next_sample());
-
-        // Take one sample and interleave it into all channels
-        for sample in frame.iter_mut() {
-            *sample = value;
-        }
-
-        #[cfg(feature = "audio_log")]
-        {
-            audio_log.write_all(bytemuck::cast_slice(&[value]));
-        }
-    }
-}
-
-// TODO: Add a feature for earlier failures
-fn audio_run<T>(device: &cpal::Device, config: &cpal::StreamConfig, audio_additional:AudioSeed) -> Result<cpal::Stream, CpalError>
-where
-    T: SizedSample + FromSample<f32> + bytemuck::Pod, /* Pod constraint can be removed without audio_log */
-{
-    // Constants for audio engine
-    const BPM:i32 = 110;
-    const SQUARE_RADIX:i32 = 32; // "Subsample" fixed point for better pitch accuracy
-    const DEFAULT_RATE:i32 = (60.0*48000.0/(BPM as f64)/4.0) as i32;
-
-    // Types for audio engine
-    #[derive(Debug, Clone)]
-    struct AdjustState {
-        root:i32,        // Base note ('notes' index)
-        pitch:i32,       // Pitch (index relative to base note)
-        rate:i32,        // Note length (samples)
-        duty:i32,        // For what portion of the note is it "held"? (per vs)
-        duty_vs:i32,     // Radix of duty (scalar)
-        duty_as_sample_cache:i32, // duty converted to samples
-    }
-
-    const DEFAULT_ADJUST:AdjustState = AdjustState {
-        root:69-12, pitch:0, rate:DEFAULT_RATE, duty:8, duty_vs:8, duty_as_sample_cache:DEFAULT_RATE
-    };
-    impl Default for AdjustState { fn default() -> Self { DEFAULT_ADJUST } }
-
-    #[derive(Debug, Clone)]
-    struct PlayState {
-        // TODO Separate? Traits?
-        synth_at:i32,       // Progress within square cycle (subsamples)
-        synth_high:bool,    // Is square high?
-
-        sample_at:i32,      // Progress within beat (samples)
-    }
-
-    #[derive(Debug, Clone, Default)]
-    struct SeqState {
-        adjust:AdjustState,
-
-        proc: Option<usize>, // A-Z or none
-        beat_at:usize,        // Beat ('song.score' index)
-    }
-
-    #[derive(Debug, Clone)]
-    struct State { // TODO rename "frame"?
-        // TODO: CoreState with pitch_vs, rate_vs?
-        seq:tinyvec::ArrayVec<[SeqState; PLAYBACK_STACK_LIMIT]>,
-        play:PlayState,
-        boot:bool // "is this the first sample"?
-    }
-    impl State {
-        fn seq_state(&self) -> &SeqState { self.seq.last().unwrap() }
-        fn seq_state_mut(&mut self) -> &mut SeqState { self.seq.last_mut().unwrap() }
-        fn seq_state_mut_play(&mut self) -> (&mut SeqState, &mut PlayState) { (self.seq.last_mut().unwrap(), &mut self.play) }
-    }
-
-    const REST_NOTE:Note = Note { span: NoteSpan::Byte(ByteSpan { begin:0, end:0 }), adjust: vec![], payload: NotePayload::Play(Pitch::Abs(0)) };
-
-    const DEFAULT_PLAY:PlayState = PlayState {
-        synth_at: 0, synth_high:false, sample_at:0
-    };
-
-    fn fit_range(x:i32) -> i32 {
-        x.clamp(0,127)
-    }
-
-    // Second return value "is proc"
-    fn playing_score<'a>(state:&State, song:&'a Song) -> (&'a Vec<Note>, bool) {
-        let seq_state = state.seq_state();
-        if let Some(proc) = seq_state.proc {
-            (&song.procs[proc], true)
-        } else {
-            (&song.score, false)
-        }
-    }
-
-    fn do_adjust(v:&Vec<Adjust>, state:&mut AdjustState, default:&AdjustState) {
-        for adjust in v {
-            match adjust {
-                Adjust::Pitch(act, _) => match act {
-                    Act::Set(x) => state.root = *x,
-                    Act::Increment(x) =>  state.root += *x,
-                    Act::Double(x) => state.root += *x * 12,
-                    Act::Versus(_) => todo!(),
-                },
-                Adjust::Tempo(act) => {
-                    match act {
-                        Act::Set(x) => state.rate = *x,
-                        Act::Increment(_) => todo!(),
-                        Act::Double(x) => if *x > 0 {
-                                state.rate *= *x;
-                            } else {
-                                state.rate /= -*x;
-                            },
-                        Act::Versus(_) => todo!(),
-                    }
-                    state.duty_as_sample_cache = state.duty * state.rate / state.duty_vs;
-                },
-                Adjust::Duty(act) => {
-                    match act {
-                        Act::Set(x) => state.duty = *x,
-                        Act::Increment(x) => state.duty += *x,
-                        Act::Double(x) => if *x > 0 {
-                            state.duty *= *x;
-                        } else {
-                            state.duty /= -*x;
-                        },
-                        Act::Versus(x) => {
-                            // Kludge?: Rescale duty to duty_vs
-                            state.duty *= state.duty_vs;
-                            state.duty_vs = *x;
-                            state.duty /= state.duty_vs;
-                            state.duty = state.duty.max(1);
-                        },
-                    }
-                    state.duty = state.duty.min(state.duty_vs);
-                    state.duty_as_sample_cache = state.duty * state.rate / state.duty_vs;
-                },
-                Adjust::Reset => *state = default.clone(),
-            }
-        }
-    }
-
-// FIXME: sample_rate is really pretty important. Currently 44100 is assumed.
-//    let sample_rate = config.sample_rate.0 as f32;
-    let channels = config.channels as usize;
-    let mut reset_adjust = DEFAULT_ADJUST;
-    let mut state = State {seq: Default::default(), play: DEFAULT_PLAY, boot: true};
-    state.seq.push(Default::default());
-    // TODO: Adjust on frame 0-- we are only loading adjustments on need_adjustment
-
-    // Copy cross thread values into closure
-    let audio_time = audio_additional.time.clone();
-    let audio_playing = audio_additional.play.clone();
-    let audio_song = audio_additional.song.clone();
-
-    // Can't have an empty song, so make a default one containing a single rest.
-    let mut song:Song = Default::default();
-    song.score.push(REST_NOTE);
-
-    // Lookup table of MIDI note -> subsample zero-crossing period of square wave
-    let notes = {
-        let mut notes:Vec<i32> = Default::default();
-        let mut base_freq = 440.0 / 32.0;
-        let semitone = (2.0_f64).powf(1.0/12.0);
-        for _ in 0..=8 { // I REFUSE to play notes below MIDI 9. I just DON'T WANT TO BOTHER.
-            notes.push(0x7FFFFFFF);
-        }
-        for _x in 0..=9 { // Nine octaves above that. Whatever
-            let mut freq = base_freq;
-            for _y in 0..12 {
-                // TODO use real sample rate
-                let period = (SQUARE_RADIX as f64*44100.0_f64/freq/2.0).floor() as i32; // div two because half cycles
-                //eprintln!("{}: {freq} = {period}", notes.len());
-                notes.push(period);
-                freq *= semitone;
-            }
-            base_freq *= 2.0;
-        }
-        notes
-    };
-
-    // Generate exactly 1 mono sample
-    let mut next_value = move || {
-        // Move forward sample counters
-        state.play.synth_at += SQUARE_RADIX;
-        state.play.sample_at += 1;
-
-        // Check for new instructions from processing thread
-        if let Some(new_song) = audio_song.swap(None, Ordering::AcqRel) {
-            song = *new_song;
-            //eprintln!("{:#?}", song.clone());
-
-            reset_adjust = DEFAULT_ADJUST;
-            do_adjust(&song.prefix, &mut reset_adjust, &DEFAULT_ADJUST);
-            // TODO: Swap instead of clear and carry across state
-            state.seq.clear();
-            state.seq.push(Default::default());
-            state.seq[0].adjust = reset_adjust.clone();
-
-            if song.score.len() == 0 {
-                song.score.push(REST_NOTE);
-            }
-        }
-
-        // True if we are focused on a different note than we were before.
-        let mut need_adjustment = state.boot;
-        state.boot = false;
-
-        // Check for end of note
-        {
-            let (seq_state, play) = state.seq_state_mut_play();
-            if play.sample_at > seq_state.adjust.rate {
-                seq_state.beat_at += 1;
-                play.sample_at = 0;
-
-                // Cancel out square wave "overrun" (already dubious)
-                if seq_state.adjust.duty < seq_state.adjust.duty_vs {
-                    state.play.synth_at = 0;
-                    state.play.synth_high = !state.play.synth_high;
-                }
-
-                need_adjustment = true;
-            }
-        }
-        // Check for end of song/proc (loop/unroll)
-        // Do this outside previous if because song can be replaced "under us"
-        {
-            #[derive(PartialEq)] enum Roll { Done, Unroll, Loop }
-            loop {
-                let roll = {
-                    let (score, is_proc) = playing_score(&state, &song);
-                    let seq_state = state.seq_state();
-                    if seq_state.beat_at >= score.len() {
-                        if is_proc { Roll::Unroll } else { Roll::Loop }
-                    } else {
-                        Roll::Done
-                    }
-                };
-                if roll == Roll::Done { break; }
-                if roll == Roll::Loop {
-                    let seq_state = state.seq_state_mut();
-                    seq_state.beat_at = 0;
-
-                    // FIXME: File a bug on Rust on what happens with this next line if you remove clone()?
-                    seq_state.adjust = reset_adjust.clone(); // Implicit reset each loop. Consider making customizable?
-                    need_adjustment = true;
-
-                    break;
-                }
-                // roll == Roll::Unroll (pick a layer off seq, incement it, loop)
-                state.seq.pop();
-                state.seq_state_mut().beat_at += 1;
-                need_adjustment = true;
-            }
-        }
-
-        // What note are we playing?
-        loop {
-            let (score, _) = playing_score(&state, &song);
-            let (seq_state, play) = state.seq_state_mut_play();
-
-            let note = &score[seq_state.beat_at];
-            if need_adjustment {
-                match &score[seq_state.beat_at] {
-                    Note {adjust:v, ..} => {
-                        do_adjust(v, &mut seq_state.adjust, &reset_adjust);
-                    },
-                    _ => unreachable!()
-                }
-                if let NotePayload::Call(idx) = &score[seq_state.beat_at].payload {
-                    let mut seq_state = seq_state.clone();
-                    seq_state.proc = Some(*idx as usize);
-                    seq_state.beat_at = 0;
-                    state.seq.push(seq_state);
-                    // Note: need_adjustment still true
-                    continue;
-                }
-            }
-
-            let pitch_index = match &score[seq_state.beat_at].payload {
-                NotePayload::Play(Pitch::Abs(x)) => fit_range(*x), // Never generated?
-                NotePayload::Play(Pitch::Rel(x)) => fit_range(*x + seq_state.adjust.root),
-                NotePayload::Play(Pitch::Rest) => 0,
-                _ => unreachable!()
-            };
-            // Map note->synth zero crossing peroid
-            let period = notes[pitch_index as usize];
-
-            // Time for synth zero crossing?
-            if play.sample_at < seq_state.adjust.duty_as_sample_cache && play.synth_at > period {
-                play.synth_high = !play.synth_high;
-                play.synth_at -= period;
-            }
-
-            // Tell the processing thread where we're at
-            audio_time.store(seq_state.beat_at as u32, Ordering::Relaxed);
-
-            // Play sound
-            if state.play.synth_high {
-                return 0.25
-            } else {
-                return 0.0 // TODO: This won't work with mixing. Fix zero_value below
-            }
-        }
-    };
-
-    let mut zero_value = || { 0.0 };
-
-    let err_fn = |err| panic!("an error occurred on stream: {}", err); // FIXME: Geez don't panic
-
-    #[cfg(feature = "audio_log")]
-    let mut audio_log = std::fs::File::create("audio_log.raw").unwrap();
-    #[cfg(not(feature = "audio_log"))]
-    let mut audio_log:AudioLog = ();
-
-    let stream = device.build_output_stream(
-        config,
-        move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-            audio_write(data, channels,
-                if audio_playing.load(Ordering::Relaxed) {
-                    &mut next_value
-                } else {
-                    &mut zero_value
-                },
-            &mut audio_log)
-        },
-        err_fn,
-        None,
-    )?;
-    stream.play()?;
-
-    Ok(stream)
-}
-
-
-fn ami_boot_audio(audio_additional:AudioSeed) -> Option<cpal::Stream> {
-    let host = cpal::default_host();
-    if let Some(device) = host.default_output_device() {
-        let config = device.default_output_config().unwrap();
-
-        let stream_result = match config.sample_format() {
-            cpal::SampleFormat::I8 => audio_run::<i8>(&device, &config.into(), audio_additional),
-            cpal::SampleFormat::I16 => audio_run::<i16>(&device, &config.into(), audio_additional),
-            // cpal::SampleFormat::I24 => audio_run::<I24>(&device, &config.into(), audio_additional),
-            cpal::SampleFormat::I32 => audio_run::<i32>(&device, &config.into(), audio_additional),
-            // cpal::SampleFormat::I48 => audio_run::<I48>(&device, &config.into(), audio_additional),
-            cpal::SampleFormat::I64 => audio_run::<i64>(&device, &config.into(), audio_additional),
-            cpal::SampleFormat::U8 => audio_run::<u8>(&device, &config.into(), audio_additional),
-            cpal::SampleFormat::U16 => audio_run::<u16>(&device, &config.into(), audio_additional),
-            // cpal::SampleFormat::U24 => audio_run::<U24>(&device, &config.into(), audio_additional),
-            cpal::SampleFormat::U32 => audio_run::<u32>(&device, &config.into(), audio_additional),
-            // cpal::SampleFormat::U48 => audio_run::<U48>(&device, &config.into(), audio_additional),
-            cpal::SampleFormat::U64 => audio_run::<u64>(&device, &config.into(), audio_additional),
-            cpal::SampleFormat::F32 => audio_run::<f32>(&device, &config.into(), audio_additional),
-            cpal::SampleFormat::F64 => audio_run::<f64>(&device, &config.into(), audio_additional),
-            sample_format => panic!("Unsupported sample format '{sample_format}'"),
-        };
-
-        match stream_result {
-            Err(e) => {
-                //warn!("Audio startup failure: {}", e); // TODO : logging
-                None
-            },
-            Ok(v) => {
-                //trace!("Audio startup success");
-                Some(v)
-            }
-        }
-    } else {
-        panic!("Failure: No audio device");
-        None
-    }
-}
-
 #[tokio::main]
 async fn main() -> io::Result<()> {
     use clap::Parser;
 
     #[derive(Parser)]
     struct Cli {
-        #[arg(long = "play")]
-        play: bool,
         #[arg(long = "print-error", short='e')]
         print_error:bool,
-        #[arg(long = "loud-syntax", short='l')]
-        loud_syntax:bool,
-        filename: Option<PathBuf>
     }
     let cli = Cli::parse();
 
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
-    let audio_time = std::sync::Arc::new(AtomicU32::new(0));
-    let audio_play = std::sync::Arc::new(AtomicBool::new(cli.play));
-    let audio_song = std::sync::Arc::new(AtomicOptionBox::<Song>::none());
-    let audio_seed = AudioSeed { time: audio_time.clone(), play: audio_play.clone(), song: audio_song.clone() };
-    let audio = ami_boot_audio(audio_seed);
 
-    let initial_has_filename = cli.filename.is_some(); // FIXME initial load audio handled flat-out wrong... this will make playing work after the first character input, which is not good enough
-    let mut vim = Vim::new(Mode::Normal, cli.filename, initial_has_filename, false, VimAudioSeed { time:audio_time, play:audio_play.clone() }); // Note: time NOT cloned
+    let mut vim = Vim::new(Mode::Normal);
 
     enable_raw_mode()?;
     crossterm::execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut term = Terminal::new(backend)?;
 
+/*
+    // Replace with whatever your basic widget is
     // This will be the file edit area.
     let init_textarea = |textarea:&mut TextArea| {
         textarea.set_block(Mode::Normal.block());
@@ -1736,6 +326,7 @@ async fn main() -> io::Result<()> {
     };
     let mut textarea = vim.load(None)?;
     init_textarea(&mut textarea);
+*/
 
     // This is the command-line-mode :entry box, which is only sometimes visible.
     let mut command = TextArea::default();
@@ -1749,8 +340,6 @@ async fn main() -> io::Result<()> {
     let mut should_quit = false;
 
     // Extra GUI state
-    let mut error_highlight: Option<TextRange> = None;
-    let mut song_highlights: Vec<TextRange> = Default::default();
     let mut current_status_message: Option<String> = None;
 
     while !should_quit {
@@ -1758,20 +347,9 @@ async fn main() -> io::Result<()> {
             // FIXME: rather than this wait on mspc messages or something
             // Used to this happened every loop
             _ = interval.tick() => {
-                let play = (*vim.audio.play).load(Ordering::Relaxed);
-                let time = (*vim.audio.time).load(Ordering::Relaxed);
-
-                // TODO: This is work! Don't do it every time
-                textarea.clear_custom_highlight();
-                if let Some(highlight) = error_highlight {
-                    textarea.custom_highlight(highlight, Style::default().fg(Color::LightRed).add_modifier(Modifier::REVERSED), 35); // TODO if possible blink 25/35
-                }
-                if (play || time > 0) && (time as usize) < song_highlights.len() {
-                    textarea.custom_highlight(song_highlights[time as usize], Style::default().fg(/*Color::LightCyan*/Color::Indexed(51)).add_modifier(Modifier::UNDERLINED), 35); // TODO if possible blink 25/35
-                }
 
                 term.draw(|f| {
-                    f.render_widget(&textarea, f.area());
+//                    f.render_widget(&textarea, f.area());
                     let mut bottom_line_area = f.area();
                     bottom_line_area.y = bottom_line_area.height-1;
                     bottom_line_area.height=1;
@@ -1790,164 +368,41 @@ async fn main() -> io::Result<()> {
                         let bar = bar.style(Style::default().fg(Color::LightRed).add_modifier(Modifier::REVERSED));
                         f.render_widget(bar, bottom_line_area);
                     } else {
-                        let bar = ratatui::widgets::Paragraph::new(format!("{} {}", if play { "PLAYING" } else {"Paused "}, time));
-                        f.render_widget(bar, bottom_line_area);
+//                        let bar = ratatui::widgets::Paragraph::new(format!("{} {}", if play { "PLAYING" } else {"Paused "}, time));
+//                        f.render_widget(bar, bottom_line_area);
                     }
                 })?;
             },
 
             // Terminal event
             Some(Ok(event)) = events.next() => {
-                match event.clone().into() { // Mode-indifferent overrides
-                    Input {
-                        key: Key::Char('p'),
-                        ctrl: true,
-                        ..
-                    } => {
-                        audio_play.fetch_xor(true, Ordering::Relaxed);
-                    },
+                match <crossterm::event::Event as Into<Input>>::into(event.clone()) { // Mode-indifferent overrides
                     _ => { // Mode match
-                        let VimChanges { transition, dirty, save_reset, file_reset, current_file, status_message } = vim.transition(event.into(), &mut textarea, &mut command);
+                        let VimChanges { transition, effect, status_message } = vim.transition(event.into(), &mut command);
 
                         if status_message.is_some() {
                             if cli.print_error { eprintln!("{}", status_message.clone().unwrap()); }
 
                             current_status_message = status_message;
-                        } else if dirty {
+                        } else if true { // TODO
                             current_status_message = None;
                         }
 
-                        // Ugly: This code is written in a super functional style and between here and the vim = my added code just treats it as mutable
-                        if save_reset { // File op cleared save
-                            vim.save_dirty = false;
-                        } else { // Change to text dirtied save
-                            vim.save_dirty = vim.save_dirty || dirty;
-                        }
-                        if file_reset { // Requested new blank file
-                            vim.current_file = None;
-                            textarea = vim.load(None)?;
-                            init_textarea(&mut textarea);
-                        } else { // Current file changed
-                            vim.current_file = current_file.or(vim.current_file);
-                        }
-                        // Change to text dirtied audio pattern
-                        vim.audio_dirty = vim.audio_dirty || dirty;
-
-                        // Throw over the wall, but ONLY if we're in normal mode *and* something changed.
+                        // Do anything?
+/*
                         match (transition.clone(), vim.mode) {
                             (Transition::Nop, Mode::Normal) |
                             (Transition::Mode(Mode::Normal), _) => {
-                                if vim.audio_dirty {
-                                    // Completely parse buffer
-                                    // TODO: Factor elsewhere
-                                    let mut line_starts:Vec<usize> = Default::default(); // notice, in BYTES
-                                    let mut all:String = Default::default();
-                                    // FIXME: Since I'm scanning twice, why not allocate an early buffer
-                                    for line in textarea.lines() {
-                                        line_starts.push(all.len());
-                                        all = all + line;
-                                        all = all + "\n";
-                                    }
-                                    let all_len = all.len();
-                                    let song = if all_len > 0 {parse_language(all)}
-                                        else { Ok(Default::default()) }; // Empty string is valid
-                                    //eprintln!("D: {:?}", song.clone()); // Before processing
-
-                                    error_highlight = None;
-
-                                    match song {
-                                        Ok(song) => {
-                                            // Calculate highlights map
-                                            {
-                                                let mut line_at = 0;
-                                                let mut char_at = 0;
-                                                let mut chars:Option<std::str::Chars> = None;
-                                                let lines = textarea.lines();
-                                                song_highlights.clear();
-                                                for note in &song.score {
-                                                    match note {
-                                                        Note { span:NoteSpan::Byte(ByteSpan { begin, end }), ..} => {
-                                                            use tuple_map::*;
-                                                            song_highlights.push((begin,end).map(|idx| {
-                                                                let idx = *idx;
-                                                                let line_at_was = line_at;
-                                                                // Step forward lines until line_starts is *just about* to pass our index.
-                                                                while line_at + 1 < line_starts.len() && line_starts[line_at+1] <= idx {
-                                                                    line_at+=1;
-                                                                }
-                                                                // We moved forward a line (or started)
-                                                                if chars.is_none() || line_at > line_at_was {
-                                                                    char_at = 0;
-                                                                    chars = Some(lines[line_at].chars()); // FIXME: fuse()?
-                                                                }
-                                                                let within_idx = idx - line_starts[line_at];
-                                                                let chars = chars.as_mut().unwrap();
-                                                                loop {
-                                                                    let position = lines[line_at].len() - chars.as_str().len(); // Freakish but works
-                                                                    if position >= within_idx { break }; // Implicitly assumes all notes length 1 or greater
-                                                                    if chars.next().is_none() { break }
-                                                                    char_at += 1;
-                                                                }
-                                                                (line_at, char_at)
-                                                            }));
-                                                        },
-                                                        _ => (),
-                                                    }
-                                                }
-                                                // Note: All ranges are incidentally +1, but that's the way TextArea wants it
-                                            }
-
-                                            audio_song.store(Some(Box::new(song)), Ordering::AcqRel)
-                                        },
-                                        Err(error) => {
-                                            // TODO: Reverse Bad position
-                                            if cli.print_error { eprintln!("Syntax: {}", error.clone()); }
-                                            if cli.loud_syntax { vim.beep(); }
-
-                                            current_status_message = Some(format!("Syntax: {}", error.clone()));
-
-                                            let position = match error {
-                                                pom::Error::Incomplete => all_len,
-                                                pom::Error::Mismatch { position, .. } |
-                                                pom::Error::Conversion { position, .. } |
-                                                pom::Error::Expect { position, .. } |
-                                                pom::Error::Custom { position, .. } => position
-                                            };
-                                            let (line_idx, line_char) = match line_starts.binary_search(&position) {
-                                                Ok(line_idx) => (line_idx, 0 as usize),
-                                                Err(line_idx_plus) => {
-                                                    let line_idx = line_idx_plus-1; // It always gives the index after, and line_starts[0] is always 0
-                                                    let line_base = line_starts[line_idx];
-                                                    let line_byte = position - line_base;
-                                                    let line_char = {
-                                                        let mut result = 0;
-                                                        for (idx, _) in textarea.lines()[line_idx].char_indices() {
-                                                            if idx >= line_byte { // Can only be > if something went real wrong with utf-8
-                                                                break;
-                                                            }
-                                                            result += 1;
-                                                        }
-                                                        result
-                                                    };
-                                                    (line_idx, line_char) // WRONG FOR UTF-8 FIXME // ALSO: CURSED RETURN
-                                                }
-                                            };
-                                            error_highlight = Some(((line_idx, line_char), (line_idx, line_char+1)));
-                                        }
-                                    }
-
-                                    vim.audio_dirty = false;
-                                }
+                                
                             },
                             _ => ()
                         };
+*/
 
                         vim = match transition {
                             // UI mode changed
                             Transition::Mode(mode) if vim.mode != mode => {
-                                textarea.set_block(mode.block());
-                                textarea.set_cursor_style(mode.cursor_style());
-                                Vim::new(mode, vim.current_file, vim.audio_dirty, vim.save_dirty, vim.audio)
+                                Vim::new(mode)
                             }
 
                             // Nothing changed
@@ -1968,8 +423,6 @@ async fn main() -> io::Result<()> {
         DisableMouseCapture
     )?;
     term.show_cursor()?;
-
-    println!("Lines: {:?}", textarea.lines());
 
     Ok(())
 }
