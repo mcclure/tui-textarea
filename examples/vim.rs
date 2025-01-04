@@ -15,35 +15,6 @@ use std::path::{Path, PathBuf};
 use std::io::BufRead;
 use tui_textarea::{CursorMove, Input, Key, Scrolling, TextArea};
 
-// Audio help-- for ami
-use std::fmt::Display;
-use cpal::traits::{HostTrait, DeviceTrait, StreamTrait};
-use cpal::{Sample, FromSample, SizedSample};
-#[cfg(feature = "audio_log")]
-use std::io::Write; // Later we might want this for file writing.
-#[cfg(feature = "audio_log")]
-type AudioLog = std::fs::File;
-#[cfg(not(feature = "audio_log"))]
-type AudioLog = ();
-#[derive(Debug)]
-enum CpalError {
-    Build(cpal::BuildStreamError),
-    Play(cpal::PlayStreamError),
-    NoDevice,
-    Unknown
-}
-impl std::error::Error for CpalError {}
-impl Display for CpalError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
-    }
-}
-impl From<cpal::BuildStreamError> for CpalError { fn from(e: cpal::BuildStreamError) -> Self { CpalError::Build(e) } }
-impl From<cpal::PlayStreamError> for CpalError { fn from(e: cpal::PlayStreamError) -> Self { CpalError::Play(e) } }
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use atomicbox::AtomicOptionBox;
-// End audio help
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Normal,
