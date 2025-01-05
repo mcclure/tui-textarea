@@ -191,6 +191,12 @@ impl Vim {
             Mode::Normal | Mode::Operator(_) => {
                 match input {
                     Input {
+                        key: Key::Char('q'),
+                        ..
+                    } => {
+                        return VimChanges { transition:Transition::Quit, ..NOP }
+                    },
+                    Input {
                         key: Key::Char(':'),
                         ..
                     } => {
