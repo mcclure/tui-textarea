@@ -325,6 +325,7 @@ async fn main() -> io::Result<()> {
     let mut should_quit = false;
 
     // ORB TECHNOLOGY
+    use glam::{UVec2, Vec2};
 
     // frame-width-in-blocks, frame-height-in-blocks, internal-width-of-block-in-pixels, internal-height-of-block-in-pixels
     type SizeQuad = (u16, u16, u16, u16);
@@ -346,14 +347,31 @@ async fn main() -> io::Result<()> {
                 };
                 let mut data:Vec<u8> = Default::default();
 
+                let size = UVec2::new(pixel_width, pixel_height).as_vec2();
+                let center = size/2.0;
+                let lesser_axis = size.x.min(size.y);
+
                 for y in 0..pixel_height {
                     for x in 0..pixel_width {
-                        data.push((x*255/pixel_width) as u8);
-                        data.push((y*255/pixel_height) as u8);
-                        data.push(((x+y)%2) as u8 * 255);
+                        let at = UVec2::new(x, y).as_vec2();
+                        let relative_at = (at - center)*2.0/lesser_axis;
+                        let dist_sq = relative_at.length_squared();
+                        //eprintln!("{at}, {relative_at}, {dist_sq}");
+
+                        if dist_sq > 1.0 {
+                            data.push(0);
+                            data.push(0);
+                            data.push(0);
+                        } else {
+                            data.push(150);
+                            data.push(222);
+                            data.push(209);
+                        }
                     }
                 }
+
                 //eprintln!("{pixel_width},{pixel_height} > {frame_width},{frame_height} ... {}", data.len());
+                //std::process::exit(0);
 
                 let raw_image = image::DynamicImage::ImageRgb8(image::ImageBuffer::from_raw(pixel_width, pixel_height, data).unwrap());
                 picker.new_protocol(raw_image, ratatui::layout::Rect::new( 0, 0, frame_width as u16, frame_height as u16), ratatui_image::Resize::Crop(None)).unwrap()
