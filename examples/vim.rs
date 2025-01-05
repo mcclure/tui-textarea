@@ -16,7 +16,7 @@ use std::io::BufRead;
 use tui_textarea::{CursorMove, Input, Key, Scrolling, TextArea};
 
 // For orb
-use ratatui_image::{picker::Picker, StatefulImage, protocol::Protocol}; // todo: protocol::StatefulProtocol
+use ratatui_image::{picker::Picker, StatefulImage, protocol::Protocol, errors::Errors as RatatuiImageErrors}; // todo: protocol::StatefulProtocol
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -290,7 +290,11 @@ async fn main() -> io::Result<()> {
     }
     let cli = Cli::parse();
 
-    let picker = Picker::from_query_stdio().unwrap(); // Must do this before stdout lock
+    let picker = match Picker::from_query_stdio() { // Must do this before stdout lock
+        Err(RatatuiImageErrors::Timeout(_)) | Err(RatatuiImageErrors::NoFontSize) =>
+            Picker::from_fontsize((8,12)),
+        r => r.unwrap()
+    };
 
     let mut stdout = io::stdout().lock();
 
