@@ -193,6 +193,10 @@ impl Vim {
                     Input {
                         key: Key::Char('q'),
                         ..
+                    } | Input {
+                        key: Key::Char('c'),
+                        ctrl: true,
+                        ..
                     } => {
                         return VimChanges { transition:Transition::Quit, ..NOP }
                     },
