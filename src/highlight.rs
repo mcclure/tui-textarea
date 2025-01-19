@@ -253,6 +253,8 @@ impl<'a> LineHighlighter<'a> {
         let mut stack = vec![];
 
         for (next_boundary, end) in boundaries {
+            let end = end.min(line.len()-1); // This will indirectly guarantee start is safe
+
             if start < end {
                 spans.push(Span::styled(builder.build(&line[start..end]), style));
             }
