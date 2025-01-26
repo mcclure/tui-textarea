@@ -14,6 +14,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::io::BufRead;
 use tui_textarea::{CursorMove, Input, Key, Scrolling, TextArea};
+use tuple_map::*;
 
 // Audio help-- for ami
 use std::fmt::Display;
@@ -106,6 +107,7 @@ enum Transition {
 // For ami
 
 const PLAYBACK_STACK_LIMIT:usize = 4;
+const CALLBACK_NONE:Option::<fn()> = None;
 
 #[derive(Debug, Clone)]
 struct SpanIndex {
@@ -555,7 +557,6 @@ impl LanguageParser {
                     for note in &song.score {
                         match note {
                             Note { span:NoteSpan::Byte(ByteSpan { begin, end }), ..} => {
-                                use tuple_map::*;
                                 song_highlights.push((begin,end).map(|idx| {
                                     let idx = *idx;
                                     let line_at_was = line_at;
@@ -638,6 +639,16 @@ struct Vim {
     audio:VimAudioSeed
 }
 
+// TODO: allow a transient and a permanent layer
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VimStatusKind {
+    Info, Error
+}
+type VimStatus = (VimStatusKind, String);
+fn vim_status_text(status: Option<VimStatus>) -> Option<String> {
+    status.map(|(_,s)| s)
+}
+
 // All changes in a single Vim transition
 struct VimChanges {
     transition:Transition,
@@ -645,7 +656,7 @@ struct VimChanges {
     save_reset: bool, // CLEARS save_dirty
     file_reset: bool, // :new, empty all text
     current_file: Option<PathBuf>, // If it changed
-    status_message: Option<String> // If it changed
+    status_message: Option<VimStatus> // If it changed
 }
 
 impl Vim {
@@ -1074,6 +1085,21 @@ impl Vim {
                         textarea.move_cursor(CursorMove::Top)
                     }
                     Input {
+                        key: Key::Char('g'),
+                        ctrl: true,
+                        ..
+                    } => {
+                        let (quote, name) = match &self.current_file {
+                            Some(name) => ("\"", name.to_string_lossy()),
+                            None => ("", "[No filename]".into())
+                        };
+                        let write_status = if self.save_dirty { " [Modified]" } else { "" };
+                        let lines = textarea.lines().len();
+                        let (l,c) = textarea.cursor().map(|x|x+1); // Note per vim standard it's 1-indexed
+                        let status_message = Some((VimStatusKind::Info, format!("{quote}{name}{quote} {lines} lines{write_status} -- {l},{c}")));
+                        return VimChanges { transition:Transition::Nop, status_message, ..NOP}
+                    }
+                    Input {
                         key: Key::Char('G'),
                         ctrl: false,
                         ..
@@ -1413,7 +1439,7 @@ impl Vim {
                         }
                     }
 
-                    VimChanges { transition:Transition::Mode(Mode::Normal), status_message:error, ..NOP }
+                    VimChanges { transition:Transition::Mode(Mode::Normal), status_message:error.map(|s| (VimStatusKind::Error, s)), ..NOP }
                 },
                 // Type into command buffer
                 _ => {
@@ -1828,10 +1854,10 @@ async fn main() -> io::Result<()> {
     let audio_play = std::sync::Arc::new(AtomicBool::new(cli.play));
     let audio_song = std::sync::Arc::new(AtomicOptionBox::<Song>::none());
     let audio_seed = AudioSeed { time: audio_time.clone(), play: audio_play.clone(), song: audio_song.clone() };
-    let audio = ami_boot_audio(audio_seed);
+    let _audio = ami_boot_audio(audio_seed); // Retain but don't use cpal::Stream object
 
-    let initial_has_filename = cli.filename.is_some(); // FIXME initial load audio handled flat-out wrong... this will make playing work after the first character input, which is not good enough
-    let mut vim = Vim::new(Mode::Normal, cli.filename, initial_has_filename, false, VimAudioSeed { time:audio_time, play:audio_play.clone() }); // Note: time NOT cloned
+    let initial_has_filename = cli.filename.is_some();
+    let mut vim = Vim::new(Mode::Normal, cli.filename, false, false, VimAudioSeed { time:audio_time, play:audio_play.clone() }); // Note: time NOT cloned
 
     enable_raw_mode()?;
     crossterm::execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -1863,7 +1889,18 @@ async fn main() -> io::Result<()> {
     // Extra GUI state
     let mut error_highlight: Option<TextRange> = None;
     let mut song_highlights: Vec<TextRange> = Default::default();
-    let mut current_status_message: Option<String> = None;
+    let mut current_status_message: Option<VimStatus> = None;
+
+    if initial_has_filename {
+        match language.parse(textarea.lines(), Some(&mut song_highlights), Some(&mut error_highlight), cli.print_error, CALLBACK_NONE) {
+            Ok(song) => {
+                audio_song.store(Some(Box::new(song)), Ordering::AcqRel);
+            },
+            Err(error) => {
+                current_status_message = Some((VimStatusKind::Error, format!("Syntax: {}", error.clone())));
+            }
+        }
+    }
 
     while !should_quit {
         tokio::select! {
@@ -1897,9 +1934,13 @@ async fn main() -> io::Result<()> {
                         bottom_line_area.x += 1;
                         bottom_line_area.width -= 1;
                         f.render_widget(&command, bottom_line_area);
-                    } else if let Some(status) = &current_status_message {
-                        let bar = ratatui::widgets::Paragraph::new(status.clone());
-                        let bar = bar.style(Style::default().fg(Color::LightRed).add_modifier(Modifier::REVERSED));
+                    } else if let Some((kind, message)) = &current_status_message {
+                        let bar = ratatui::widgets::Paragraph::new(message.clone());
+                        let mut style = Style::default().add_modifier(Modifier::REVERSED);
+                        if *kind == VimStatusKind::Error {
+                            style = style.fg(Color::LightRed);
+                        }
+                        let bar = bar.style(style);
                         f.render_widget(bar, bottom_line_area);
                     } else {
                         let bar = ratatui::widgets::Paragraph::new(format!("{} {}", if play { "PLAYING" } else {"Paused "}, time));
@@ -1922,7 +1963,7 @@ async fn main() -> io::Result<()> {
                         let VimChanges { transition, dirty, save_reset, file_reset, current_file, status_message } = vim.transition(event.into(), &mut textarea, &mut command);
 
                         if status_message.is_some() {
-                            if cli.print_error { eprintln!("{}", status_message.clone().unwrap()); }
+                            if cli.print_error { eprintln!("{}", vim_status_text(status_message.clone()).unwrap()); }
 
                             current_status_message = status_message;
                         } else if dirty {
@@ -1957,7 +1998,7 @@ async fn main() -> io::Result<()> {
                                             audio_song.store(Some(Box::new(song)), Ordering::AcqRel);
                                         },
                                         Err(error) => {
-                                            current_status_message = Some(format!("Syntax: {}", error.clone()));
+                                            current_status_message = Some((VimStatusKind::Error, format!("Syntax: {}", error.clone())));
                                         }
                                     }
 
