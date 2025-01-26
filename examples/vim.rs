@@ -518,6 +518,116 @@ fn parse_command_line(input:String) -> Result<CommandLine, pom::Error> { // FIXM
     parser.parse_str(&input)
 }
 
+struct LanguageParser {
+
+}
+
+impl LanguageParser {
+    fn new() -> Self { Self {} }
+
+    fn parse<F>(&self, lines:&[String], song_highlights:Option<&mut Vec<TextRange>>, error_highlight: Option<&mut Option<TextRange>>, print_stderr:bool, beep:Option<F>) -> Result<Song, pom::Error> where F: FnOnce() {
+        // Completely parse buffer
+        let mut line_starts:Vec<usize> = Default::default(); // notice, in BYTES
+        let mut all:String = Default::default();
+        // FIXME: Since I'm scanning twice, why not allocate an early buffer
+        for line in lines {
+            line_starts.push(all.len());
+            all = all + line;
+            all = all + "\n";
+        }
+        let all_len = all.len();
+        let song = if all_len > 0 {parse_language(all)}
+            else { Ok(Default::default()) }; // Empty string is valid
+        //eprintln!("D: {:?}", song.clone()); // Before processing
+
+        match song {
+            Ok(song) => {
+                if let Some(error_highlight) = error_highlight {
+                    *error_highlight = None;
+                }
+
+                // Calculate highlights map
+                if let Some(song_highlights) = song_highlights {
+                    let mut line_at = 0;
+                    let mut char_at = 0;
+                    let mut chars:Option<std::str::Chars> = None;
+                    song_highlights.clear();
+                    for note in &song.score {
+                        match note {
+                            Note { span:NoteSpan::Byte(ByteSpan { begin, end }), ..} => {
+                                use tuple_map::*;
+                                song_highlights.push((begin,end).map(|idx| {
+                                    let idx = *idx;
+                                    let line_at_was = line_at;
+                                    // Step forward lines until line_starts is *just about* to pass our index.
+                                    while line_at + 1 < line_starts.len() && line_starts[line_at+1] <= idx {
+                                        line_at+=1;
+                                    }
+                                    // We moved forward a line (or started)
+                                    if chars.is_none() || line_at > line_at_was {
+                                        char_at = 0;
+                                        chars = Some(lines[line_at].chars()); // FIXME: fuse()?
+                                    }
+                                    let within_idx = idx - line_starts[line_at];
+                                    let chars = chars.as_mut().unwrap();
+                                    loop {
+                                        let position = lines[line_at].len() - chars.as_str().len(); // Freakish but works
+                                        if position >= within_idx { break }; // Implicitly assumes all notes length 1 or greater
+                                        if chars.next().is_none() { break }
+                                        char_at += 1;
+                                    }
+                                    (line_at, char_at)
+                                }));
+                            },
+                            _ => (),
+                        }
+                    }
+                    // Note: All ranges are incidentally +1, but that's the way TextArea wants it
+                }
+
+                Ok(song)
+            },
+            Err(error) => {
+                // TODO: Reverse Bad position
+                if print_stderr { eprintln!("Syntax: {}", error.clone()); }
+                if let Some(beep) = beep { beep(); }
+
+                if let Some(error_highlight) = error_highlight {
+                    let position = match error.clone() {
+                        pom::Error::Incomplete => all_len,
+                        pom::Error::Mismatch { position, .. } |
+                        pom::Error::Conversion { position, .. } |
+                        pom::Error::Expect { position, .. } |
+                        pom::Error::Custom { position, .. } => position
+                    };
+                    let (line_idx, line_char) = match line_starts.binary_search(&position) {
+                        Ok(line_idx) => (line_idx, 0 as usize),
+                        Err(line_idx_plus) => {
+                            let line_idx = line_idx_plus-1; // It always gives the index after, and line_starts[0] is always 0
+                            let line_base = line_starts[line_idx];
+                            let line_byte = position - line_base;
+                            let line_char = {
+                                let mut result = 0;
+                                for (idx, _) in lines[line_idx].char_indices() {
+                                    if idx >= line_byte { // Can only be > if something went real wrong with utf-8
+                                        break;
+                                    }
+                                    result += 1;
+                                }
+                                result
+                            };
+                            (line_idx, line_char) // WRONG FOR UTF-8 FIXME // ALSO: CURSED RETURN
+                        }
+                    };
+                    *error_highlight = Some(((line_idx, line_char), (line_idx, line_char+1)));
+                }
+
+                Err(error)
+            }
+        }
+    }
+}
+
 // State of Vim emulation
 struct Vim {
     mode: Mode,
@@ -1737,6 +1847,8 @@ async fn main() -> io::Result<()> {
     let mut textarea = vim.load(None)?;
     init_textarea(&mut textarea);
 
+    let language = LanguageParser::new();
+
     // This is the command-line-mode :entry box, which is only sometimes visible.
     let mut command = TextArea::default();
     command.set_block(Block::default().borders(Borders::NONE));
@@ -1838,101 +1950,14 @@ async fn main() -> io::Result<()> {
                             (Transition::Nop, Mode::Normal) |
                             (Transition::Mode(Mode::Normal), _) => {
                                 if vim.audio_dirty {
-                                    // Completely parse buffer
-                                    // TODO: Factor elsewhere
-                                    let mut line_starts:Vec<usize> = Default::default(); // notice, in BYTES
-                                    let mut all:String = Default::default();
-                                    // FIXME: Since I'm scanning twice, why not allocate an early buffer
-                                    for line in textarea.lines() {
-                                        line_starts.push(all.len());
-                                        all = all + line;
-                                        all = all + "\n";
-                                    }
-                                    let all_len = all.len();
-                                    let song = if all_len > 0 {parse_language(all)}
-                                        else { Ok(Default::default()) }; // Empty string is valid
-                                    //eprintln!("D: {:?}", song.clone()); // Before processing
+                                    let beep = if cli.loud_syntax { None } else { Some(|| vim.beep()) };
 
-                                    error_highlight = None;
-
-                                    match song {
+                                    match language.parse(textarea.lines(), Some(&mut song_highlights), Some(&mut error_highlight), cli.print_error, beep) {
                                         Ok(song) => {
-                                            // Calculate highlights map
-                                            {
-                                                let mut line_at = 0;
-                                                let mut char_at = 0;
-                                                let mut chars:Option<std::str::Chars> = None;
-                                                let lines = textarea.lines();
-                                                song_highlights.clear();
-                                                for note in &song.score {
-                                                    match note {
-                                                        Note { span:NoteSpan::Byte(ByteSpan { begin, end }), ..} => {
-                                                            use tuple_map::*;
-                                                            song_highlights.push((begin,end).map(|idx| {
-                                                                let idx = *idx;
-                                                                let line_at_was = line_at;
-                                                                // Step forward lines until line_starts is *just about* to pass our index.
-                                                                while line_at + 1 < line_starts.len() && line_starts[line_at+1] <= idx {
-                                                                    line_at+=1;
-                                                                }
-                                                                // We moved forward a line (or started)
-                                                                if chars.is_none() || line_at > line_at_was {
-                                                                    char_at = 0;
-                                                                    chars = Some(lines[line_at].chars()); // FIXME: fuse()?
-                                                                }
-                                                                let within_idx = idx - line_starts[line_at];
-                                                                let chars = chars.as_mut().unwrap();
-                                                                loop {
-                                                                    let position = lines[line_at].len() - chars.as_str().len(); // Freakish but works
-                                                                    if position >= within_idx { break }; // Implicitly assumes all notes length 1 or greater
-                                                                    if chars.next().is_none() { break }
-                                                                    char_at += 1;
-                                                                }
-                                                                (line_at, char_at)
-                                                            }));
-                                                        },
-                                                        _ => (),
-                                                    }
-                                                }
-                                                // Note: All ranges are incidentally +1, but that's the way TextArea wants it
-                                            }
-
-                                            audio_song.store(Some(Box::new(song)), Ordering::AcqRel)
+                                            audio_song.store(Some(Box::new(song)), Ordering::AcqRel);
                                         },
                                         Err(error) => {
-                                            // TODO: Reverse Bad position
-                                            if cli.print_error { eprintln!("Syntax: {}", error.clone()); }
-                                            if cli.loud_syntax { vim.beep(); }
-
                                             current_status_message = Some(format!("Syntax: {}", error.clone()));
-
-                                            let position = match error {
-                                                pom::Error::Incomplete => all_len,
-                                                pom::Error::Mismatch { position, .. } |
-                                                pom::Error::Conversion { position, .. } |
-                                                pom::Error::Expect { position, .. } |
-                                                pom::Error::Custom { position, .. } => position
-                                            };
-                                            let (line_idx, line_char) = match line_starts.binary_search(&position) {
-                                                Ok(line_idx) => (line_idx, 0 as usize),
-                                                Err(line_idx_plus) => {
-                                                    let line_idx = line_idx_plus-1; // It always gives the index after, and line_starts[0] is always 0
-                                                    let line_base = line_starts[line_idx];
-                                                    let line_byte = position - line_base;
-                                                    let line_char = {
-                                                        let mut result = 0;
-                                                        for (idx, _) in textarea.lines()[line_idx].char_indices() {
-                                                            if idx >= line_byte { // Can only be > if something went real wrong with utf-8
-                                                                break;
-                                                            }
-                                                            result += 1;
-                                                        }
-                                                        result
-                                                    };
-                                                    (line_idx, line_char) // WRONG FOR UTF-8 FIXME // ALSO: CURSED RETURN
-                                                }
-                                            };
-                                            error_highlight = Some(((line_idx, line_char), (line_idx, line_char+1)));
                                         }
                                     }
 
