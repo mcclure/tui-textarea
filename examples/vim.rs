@@ -452,6 +452,7 @@ enum CommandLine {
     Wqae(bool, bool, CommandLineTotality, bool), // Write, Quit, All/Buffer, Exclamation
     Help(String),
     Set(String, CommandLineSetType), // What you set, what you set it to // TODO: Local?
+    Play(bool, String), // override-'!!'?, program
     Beep
 //    Play(Option<u32>)
 //    Split(Option<String>), // Filename
@@ -514,6 +515,11 @@ fn parse_command_line(input:String) -> Result<CommandLine, pom::Error> { // FIXM
                     | seq("?").map(|_|CommandLineSetType::Question)
                 ))
             ).map(|(s,t)|CommandLine::Set(s.to_string(), t))
+
+        | ((seq("play").discard() | sym('p').discard())
+            * sym('!').discard().opt()
+                + space().discard().opt() // Unusually, space optional here. Note trailing ! is NOT ambiguous
+            * any().repeat(1..).collect()).map(|(o,s)| CommandLine::Play(o.is_some(),s.to_string()))
 
         | (seq("beep").map(|_| CommandLine::Beep))
     ) - end();
@@ -656,7 +662,8 @@ struct VimChanges {
     save_reset: bool, // CLEARS save_dirty
     file_reset: bool, // :new, empty all text
     current_file: Option<PathBuf>, // If it changed
-    status_message: Option<VimStatus> // If it changed
+    status_message: Option<VimStatus>, // If it changed
+    immediate_play: Option<(bool, String)> // :play
 }
 
 impl Vim {
@@ -741,7 +748,7 @@ impl Vim {
     // Result: This function should not modify vim, only provide a set of changes to apply to vim
     fn transition(&self, input: Input, textarea: &mut TextArea<'_>, command: &mut TextArea<'_>) -> VimChanges {
         const NOP:VimChanges = VimChanges {
-            transition:Transition::Nop, dirty:false, save_reset:false, file_reset:false, current_file:None, status_message:None
+            transition:Transition::Nop, dirty:false, save_reset:false, file_reset:false, current_file:None, status_message:None, immediate_play:None
         };
 
         if input.key == Key::Null {
@@ -1097,7 +1104,7 @@ impl Vim {
                         let lines = textarea.lines().len();
                         let (l,c) = textarea.cursor().map(|x|x+1); // Note per vim standard it's 1-indexed
                         let status_message = Some((VimStatusKind::Info, format!("{quote}{name}{quote} {lines} lines{write_status} -- {l},{c}")));
-                        return VimChanges { transition:Transition::Nop, status_message, ..NOP}
+                        return VimChanges { status_message, ..NOP}
                     }
                     Input {
                         key: Key::Char('G'),
@@ -1429,6 +1436,9 @@ impl Vim {
                                 },
                             }
                         },
+                        Ok(CommandLine::Play(o, s)) => {
+                            return VimChanges { transition:Transition::Mode(Mode::Normal), immediate_play:Some((o, s)), ..NOP }
+                        },
                         Ok(CommandLine::Beep) => {
                             self.beep();
                         },
@@ -1454,7 +1464,8 @@ impl Vim {
 struct AudioSeed {
     time: std::sync::Arc<AtomicU32>,
     play: std::sync::Arc<AtomicBool>,
-    song: std::sync::Arc<AtomicOptionBox<Song>>
+    song: std::sync::Arc<AtomicOptionBox<Song>>,
+    immediate_song: std::sync::Arc<AtomicOptionBox<(bool, Song)>>
 }
 
 fn audio_write<T>(output: &mut [T], channels: usize, next_sample: &mut dyn FnMut() -> f32, audio_log: &mut AudioLog)
@@ -1604,14 +1615,21 @@ where
 //    let sample_rate = config.sample_rate.0 as f32;
     let channels = config.channels as usize;
     let mut reset_adjust = DEFAULT_ADJUST;
-    let mut state = State {seq: Default::default(), play: DEFAULT_PLAY, boot: true};
-    state.seq.push(Default::default());
+    let default_state = || {
+        let mut state = State {seq: Default::default(), play: DEFAULT_PLAY, boot: true};
+        state.seq.push(Default::default());
+        state
+    };
+    let mut state = default_state();
     // TODO: Adjust on frame 0-- we are only loading adjustments on need_adjustment
 
     // Copy cross thread values into closure
-    let audio_time = audio_additional.time.clone();
-    let audio_playing = audio_additional.play.clone();
-    let audio_song = audio_additional.song.clone();
+    let AudioSeed {
+        time: audio_time,
+        play: audio_playing,
+        song: audio_song,
+        immediate_song: audio_immediate_song
+    } = audio_additional;
 
     // Can't have an empty song, so make a default one containing a single rest.
     let mut song:Song = Default::default();
@@ -1639,13 +1657,13 @@ where
         notes
     };
 
+    let mut immediate:Option<(Song, State)> = None;
+
     // Generate exactly 1 mono sample
     let mut next_value = move || {
-        // Move forward sample counters
-        state.play.synth_at += SQUARE_RADIX;
-        state.play.sample_at += 1;
+        // -- First check messages from other thread
 
-        // Check for new instructions from processing thread
+        // Entire new song from processing thread
         if let Some(new_song) = audio_song.swap(None, Ordering::AcqRel) {
             song = *new_song;
             //eprintln!("{:#?}", song.clone());
@@ -1662,9 +1680,39 @@ where
             }
         }
 
+        // :play received
+        if let Some(tuple) = audio_immediate_song.swap(None, Ordering::AcqRel) {
+            let (force_default_state, new_immediate_song) = *tuple; // Unbox
+            eprintln!("ZXGOT {:?}", new_immediate_song);
+            let mut new_immediate_state = default_state();
+            if !force_default_state { // Unless `!`, reuse current song's `!!`
+                new_immediate_state.seq[0].adjust = reset_adjust.clone();
+            }
+            immediate = Some((new_immediate_song, new_immediate_state))
+        }
+
+        // Verify we should do anything
+        if !(immediate.is_some() || audio_playing.load(Ordering::Relaxed)) {
+            return 0.0;
+        }
+
+        // Check if we should ignore our current song/state and service a :play.
+        let (mut song, mut state, immediate_swap) =
+            if let Some((new_song, new_state)) = &mut immediate {
+                (new_song, new_state, Some((&mut song, &mut state))) // immediate_swap is like a 1-element stack
+            } else {
+                (&mut song, &mut state, None)
+            };
+
+        // -- Play audio --
+
         // True if we are focused on a different note than we were before.
         let mut need_adjustment = state.boot;
         state.boot = false;
+
+        // Move forward sample counters
+        state.play.synth_at += SQUARE_RADIX;
+        state.play.sample_at += 1;
 
         // Check for end of note
         {
@@ -1683,7 +1731,7 @@ where
             }
         }
         // Check for end of song/proc (loop/unroll)
-        // Do this outside previous if because song can be replaced "under us"
+        // Do this outside previous if, because song can be replaced "under us"
         {
             #[derive(PartialEq)] enum Roll { Done, Unroll, Loop }
             loop {
@@ -1698,12 +1746,16 @@ where
                 };
                 if roll == Roll::Done { break; }
                 if roll == Roll::Loop {
-                    let seq_state = state.seq_state_mut();
-                    seq_state.beat_at = 0;
+                    if let Some((original_song, original_state)) = immediate_swap {
+                        (song, state, immediate) = (original_song, original_state, None);
+                    } else {
+                        let seq_state = state.seq_state_mut();
+                        seq_state.beat_at = 0;
 
-                    // FIXME: File a bug on Rust on what happens with this next line if you remove clone()?
-                    seq_state.adjust = reset_adjust.clone(); // Implicit reset each loop. Consider making customizable?
-                    need_adjustment = true;
+                        // FIXME: File a bug on Rust on what happens with this next line if you remove clone()?
+                        seq_state.adjust = reset_adjust.clone(); // Implicit reset each loop. Consider making customizable?
+                        need_adjustment = true;
+                    }
 
                     break;
                 }
@@ -1719,17 +1771,18 @@ where
             let (score, _) = playing_score(&state, &song);
             let (seq_state, play) = state.seq_state_mut_play();
 
+            // Pick a candidate note
             let note = &score[seq_state.beat_at];
             if need_adjustment {
-                match &score[seq_state.beat_at] {
+                match note {
                     Note {adjust:v, ..} => {
                         do_adjust(v, &mut seq_state.adjust, &reset_adjust);
                     },
-                    _ => unreachable!()
                 }
-                if let NotePayload::Call(idx) = &score[seq_state.beat_at].payload {
+                // Oops, this isn't a note but a GOTO. Repeat the loop 
+                if let NotePayload::Call(idx) = note.payload {
                     let mut seq_state = seq_state.clone();
-                    seq_state.proc = Some(*idx as usize);
+                    seq_state.proc = Some(idx as usize);
                     seq_state.beat_at = 0;
                     state.seq.push(seq_state);
                     // Note: need_adjustment still true
@@ -1737,6 +1790,7 @@ where
                 }
             }
 
+            // Convert note format
             let pitch_index = match &score[seq_state.beat_at].payload {
                 NotePayload::Play(Pitch::Abs(x)) => fit_range(*x), // Never generated?
                 NotePayload::Play(Pitch::Rel(x)) => fit_range(*x + seq_state.adjust.root),
@@ -1777,11 +1831,7 @@ where
         config,
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
             audio_write(data, channels,
-                if audio_playing.load(Ordering::Relaxed) {
-                    &mut next_value
-                } else {
-                    &mut zero_value
-                },
+                &mut next_value,
             &mut audio_log)
         },
         err_fn,
@@ -1853,7 +1903,8 @@ async fn main() -> io::Result<()> {
     let audio_time = std::sync::Arc::new(AtomicU32::new(0));
     let audio_play = std::sync::Arc::new(AtomicBool::new(cli.play));
     let audio_song = std::sync::Arc::new(AtomicOptionBox::<Song>::none());
-    let audio_seed = AudioSeed { time: audio_time.clone(), play: audio_play.clone(), song: audio_song.clone() };
+    let audio_immediate_song = std::sync::Arc::new(AtomicOptionBox::<(bool, Song)>::none());
+    let audio_seed = AudioSeed { time: audio_time.clone(), play: audio_play.clone(), song: audio_song.clone(), immediate_song: audio_immediate_song.clone() };
     let _audio = ami_boot_audio(audio_seed); // Retain but don't use cpal::Stream object
 
     let initial_has_filename = cli.filename.is_some();
@@ -1960,7 +2011,20 @@ async fn main() -> io::Result<()> {
                         audio_play.fetch_xor(true, Ordering::Relaxed);
                     },
                     _ => { // Mode match
-                        let VimChanges { transition, dirty, save_reset, file_reset, current_file, status_message } = vim.transition(event.into(), &mut textarea, &mut command);
+                        let VimChanges { transition, dirty, save_reset, file_reset, current_file, status_message, immediate_play } = vim.transition(event.into(), &mut textarea, &mut command);
+
+                        if let Some((force_default_state, str)) = immediate_play {
+                            let beep = if cli.loud_syntax { Some(|| vim.beep()) } else { None };
+
+                            match language.parse(&[str], None, None, cli.print_error, beep) {
+                                Ok(song) => {
+                                    audio_immediate_song.store(Some(Box::new((force_default_state, song))), Ordering::AcqRel);
+                                },
+                                Err(error) => {
+                                    current_status_message = Some((VimStatusKind::Error, format!("Syntax: {}", error.clone())));
+                                }
+                            }
+                        }
 
                         if status_message.is_some() {
                             if cli.print_error { eprintln!("{}", vim_status_text(status_message.clone()).unwrap()); }
@@ -1991,7 +2055,7 @@ async fn main() -> io::Result<()> {
                             (Transition::Nop, Mode::Normal) |
                             (Transition::Mode(Mode::Normal), _) => {
                                 if vim.audio_dirty {
-                                    let beep = if cli.loud_syntax { None } else { Some(|| vim.beep()) };
+                                    let beep = if cli.loud_syntax { Some(|| vim.beep()) } else { None };
 
                                     match language.parse(textarea.lines(), Some(&mut song_highlights), Some(&mut error_highlight), cli.print_error, beep) {
                                         Ok(song) => {
