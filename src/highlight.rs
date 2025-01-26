@@ -216,6 +216,7 @@ impl<'a> LineHighlighter<'a> {
     }
 
     pub fn into_spans(self) -> Line<'a> {
+        if self.line.len() == 0 { return Default::default(); } // If the line is empty it can't contain spans
         let Self {
             line,
             mut spans,
