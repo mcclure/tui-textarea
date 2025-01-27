@@ -41,7 +41,7 @@ impl Display for CpalError {
 }
 impl From<cpal::BuildStreamError> for CpalError { fn from(e: cpal::BuildStreamError) -> Self { CpalError::Build(e) } }
 impl From<cpal::PlayStreamError> for CpalError { fn from(e: cpal::PlayStreamError) -> Self { CpalError::Play(e) } }
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use atomicbox::AtomicOptionBox;
 // End audio help
 
@@ -121,7 +121,7 @@ struct VimAudioPlaybackStatus {
 }
 
 struct VimAudioSeed {
-    time: std::sync::Arc<AtomicU32>,
+    time: std::sync::Arc<AtomicI32>, // Negative indicates immediate (`:play`)
     play: std::sync::Arc<AtomicBool>,
 }
 
@@ -452,7 +452,7 @@ enum CommandLine {
     Wqae(bool, bool, CommandLineTotality, bool), // Write, Quit, All/Buffer, Exclamation
     Help(String),
     Set(String, CommandLineSetType), // What you set, what you set it to // TODO: Local?
-    Play(bool, String), // override-'!!'?, program
+    Play(bool, String), // override-'!'?, program
     Beep
 //    Play(Option<u32>)
 //    Split(Option<String>), // Filename
@@ -1462,7 +1462,7 @@ impl Vim {
 }
 
 struct AudioSeed {
-    time: std::sync::Arc<AtomicU32>,
+    time: std::sync::Arc<AtomicI32>,
     play: std::sync::Arc<AtomicBool>,
     song: std::sync::Arc<AtomicOptionBox<Song>>,
     immediate_song: std::sync::Arc<AtomicOptionBox<(bool, Song)>>
@@ -1683,9 +1683,8 @@ where
         // :play received
         if let Some(tuple) = audio_immediate_song.swap(None, Ordering::AcqRel) {
             let (force_default_state, new_immediate_song) = *tuple; // Unbox
-            eprintln!("ZXGOT {:?}", new_immediate_song);
             let mut new_immediate_state = default_state();
-            if !force_default_state { // Unless `!`, reuse current song's `!!`
+            if !force_default_state { // Unless `!`, reuse current song's `!`
                 new_immediate_state.seq[0].adjust = reset_adjust.clone();
             }
             immediate = Some((new_immediate_song, new_immediate_state))
@@ -1732,6 +1731,7 @@ where
         }
         // Check for end of song/proc (loop/unroll)
         // Do this outside previous if, because song can be replaced "under us"
+        let mut is_immediate = immediate_swap.is_some(); // Should we tell the GUI we're playing a :play?
         {
             #[derive(PartialEq)] enum Roll { Done, Unroll, Loop }
             loop {
@@ -1747,6 +1747,7 @@ where
                 if roll == Roll::Done { break; }
                 if roll == Roll::Loop {
                     if let Some((original_song, original_state)) = immediate_swap {
+                        is_immediate = false;
                         (song, state, immediate) = (original_song, original_state, None);
                     } else {
                         let seq_state = state.seq_state_mut();
@@ -1807,7 +1808,7 @@ where
             }
 
             // Tell the processing thread where we're at
-            audio_time.store(seq_state.beat_at as u32, Ordering::Relaxed);
+            audio_time.store(seq_state.beat_at as i32 * if is_immediate { -1 } else { 1 }, Ordering::Relaxed);
 
             // Play sound
             if state.play.synth_high {
@@ -1900,7 +1901,7 @@ async fn main() -> io::Result<()> {
 
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
-    let audio_time = std::sync::Arc::new(AtomicU32::new(0));
+    let audio_time = std::sync::Arc::new(AtomicI32::new(0));
     let audio_play = std::sync::Arc::new(AtomicBool::new(cli.play));
     let audio_song = std::sync::Arc::new(AtomicOptionBox::<Song>::none());
     let audio_immediate_song = std::sync::Arc::new(AtomicOptionBox::<(bool, Song)>::none());
@@ -1994,7 +1995,7 @@ async fn main() -> io::Result<()> {
                         let bar = bar.style(style);
                         f.render_widget(bar, bottom_line_area);
                     } else {
-                        let bar = ratatui::widgets::Paragraph::new(format!("{} {}", if play { "PLAYING" } else {"Paused "}, time));
+                        let bar = ratatui::widgets::Paragraph::new(format!("{} {}{}", if play || time < 0 { "PLAYING" } else {"Paused "}, if time<0 {":"} else {""}, time.abs()));
                         f.render_widget(bar, bottom_line_area);
                     }
                 })?;
